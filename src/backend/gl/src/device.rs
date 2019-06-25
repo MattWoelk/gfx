@@ -1,26 +1,27 @@
 use std::borrow::Borrow;
 use std::cell::Cell;
-use std::iter::repeat;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, RwLock};
-use std::{mem, ptr, slice};
+use std::slice;
 
-use gl::types::{GLenum, GLfloat, GLint};
-use {gl, GlContainer};
+use glow::Context;
+use crate::{GlContainer, GlContext};
 
-use hal::backend::FastHashMap;
-use hal::format::{Format, Swizzle};
-use hal::pool::CommandPoolCreateFlags;
-use hal::queue::QueueFamilyId;
-use hal::range::RangeArg;
-use hal::{self as c, buffer, device as d, error, image as i, mapping, memory, pass, pso, query};
+use crate::hal::backend::FastHashMap;
+use crate::hal::format::{Format, Swizzle};
+use crate::hal::pool::CommandPoolCreateFlags;
+use crate::hal::queue::QueueFamilyId;
+use crate::hal::range::RangeArg;
+use crate::hal::{
+    self as c, buffer, device as d, error, image as i, mapping, memory, pass, pso, query,
+};
 
 use spirv_cross::{glsl, spirv, ErrorCode as SpirvErrorCode};
 
-use info::LegacyFeatures;
-use pool::{BufferMemory, OwnedBuffer, RawCommandPool};
-use {conv, native as n, state};
-use {Backend as B, Share, Starc, Surface, Swapchain};
+use crate::info::LegacyFeatures;
+use crate::pool::{BufferMemory, OwnedBuffer, RawCommandPool};
+use crate::{conv, native as n, state};
+use crate::{Backend as B, Share, MemoryUsage, Starc, Surface, Swapchain};
 
 /// Emit error during shader module creation. Used if we don't expect an error
 /// but might panic due to an exception in SPIRV-Cross.
@@ -32,66 +33,11 @@ fn gen_unexpected_error(err: SpirvErrorCode) -> d::ShaderError {
     d::ShaderError::CompilationFailed(msg)
 }
 
-fn get_shader_iv(gl: &GlContainer, name: n::Shader, query: GLenum) -> gl::types::GLint {
-    let mut iv = 0;
-    unsafe { gl.GetShaderiv(name, query, &mut iv) };
-    iv
-}
-
-fn get_program_iv(gl: &GlContainer, name: n::Program, query: GLenum) -> gl::types::GLint {
-    let mut iv = 0;
-    unsafe { gl.GetProgramiv(name, query, &mut iv) };
-    iv
-}
-
-fn get_shader_log(gl: &GlContainer, name: n::Shader) -> String {
-    let mut length = get_shader_iv(gl, name, gl::INFO_LOG_LENGTH);
-    if length > 0 {
-        let mut log = String::with_capacity(length as usize);
-        log.extend(repeat('\0').take(length as usize));
-        unsafe {
-            gl.GetShaderInfoLog(
-                name,
-                length,
-                &mut length,
-                (&log[..]).as_ptr() as *mut gl::types::GLchar,
-            );
-        }
-        log.truncate(length as usize);
-        log
-    } else {
-        String::new()
-    }
-}
-
-pub(crate) fn get_program_log(gl: &GlContainer, name: n::Program) -> String {
-    let mut length = get_program_iv(gl, name, gl::INFO_LOG_LENGTH);
-    if length > 0 {
-        let mut log = String::with_capacity(length as usize);
-        log.extend(repeat('\0').take(length as usize));
-        unsafe {
-            gl.GetProgramInfoLog(
-                name,
-                length,
-                &mut length,
-                (&log[..]).as_ptr() as *mut gl::types::GLchar,
-            );
-        }
-        log.truncate(length as usize);
-        log
-    } else {
-        String::new()
-    }
-}
-
-fn create_fbo_internal(share: &Starc<Share>) -> Option<gl::types::GLuint> {
+fn create_fbo_internal(share: &Starc<Share>) -> Option<<GlContext as glow::Context>::Framebuffer> {
     if share.private_caps.framebuffer {
         let gl = &share.context;
-        let mut name = 0 as n::FrameBuffer;
-        unsafe {
-            gl.GenFramebuffers(1, &mut name);
-        }
-        info!("\tCreated frame buffer {}", name);
+        let name = unsafe { gl.create_framebuffer() }.unwrap();
+        info!("\tCreated frame buffer {:?}", name);
         Some(name)
     } else {
         None
@@ -101,7 +47,7 @@ fn create_fbo_internal(share: &Starc<Share>) -> Option<gl::types::GLuint> {
 /// GL device.
 #[derive(Debug)]
 pub struct Device {
-    share: Starc<Share>,
+    pub(crate) share: Starc<Share>,
 }
 
 impl Drop for Device {
@@ -118,41 +64,36 @@ impl Device {
 
     pub fn create_shader_module_from_source(
         &self,
-        data: &[u8],
+        shader: &str,
         stage: pso::Stage,
     ) -> Result<n::ShaderModule, d::ShaderError> {
         let gl = &self.share.context;
 
-        let can_compute = self.share.limits.max_compute_group_count[0] != 0;
+        let can_compute = self.share.limits.max_compute_work_group_count[0] != 0;
         let can_tessellate = self.share.limits.max_patch_size != 0;
         let target = match stage {
-            pso::Stage::Vertex => gl::VERTEX_SHADER,
-            pso::Stage::Hull if can_tessellate => gl::TESS_CONTROL_SHADER,
-            pso::Stage::Domain if can_tessellate => gl::TESS_EVALUATION_SHADER,
-            pso::Stage::Geometry => gl::GEOMETRY_SHADER,
-            pso::Stage::Fragment => gl::FRAGMENT_SHADER,
-            pso::Stage::Compute if can_compute => gl::COMPUTE_SHADER,
+            pso::Stage::Vertex => glow::VERTEX_SHADER,
+            pso::Stage::Hull if can_tessellate => glow::TESS_CONTROL_SHADER,
+            pso::Stage::Domain if can_tessellate => glow::TESS_EVALUATION_SHADER,
+            pso::Stage::Geometry => glow::GEOMETRY_SHADER,
+            pso::Stage::Fragment => glow::FRAGMENT_SHADER,
+            pso::Stage::Compute if can_compute => glow::COMPUTE_SHADER,
             _ => return Err(d::ShaderError::UnsupportedStage(stage)),
         };
 
-        let name = unsafe { gl.CreateShader(target) };
+        let name = unsafe { gl.create_shader(target) }.unwrap();
         unsafe {
-            gl.ShaderSource(
-                name,
-                1,
-                &(data.as_ptr() as *const gl::types::GLchar),
-                &(data.len() as gl::types::GLint),
-            );
-            gl.CompileShader(name);
+            gl.shader_source(name, shader);
+            gl.compile_shader(name);
         }
-        info!("\tCompiled shader {}", name);
+        info!("\tCompiled shader {:?}", name);
         if let Err(err) = self.share.check() {
             panic!("Error compiling shader: {:?}", err);
         }
 
-        let status = get_shader_iv(gl, name, gl::COMPILE_STATUS);
-        let log = get_shader_log(gl, name);
-        if status != 0 {
+        let compiled_ok = unsafe { gl.get_shader_compile_status(name) };
+        let log = unsafe { gl.get_shader_info_log(name) };
+        if compiled_ok {
             if !log.is_empty() {
                 warn!("\tLog: {}", log);
             }
@@ -162,58 +103,38 @@ impl Device {
         }
     }
 
-    fn bind_target_compat(
-        gl: &GlContainer,
-        point: GLenum,
-        attachment: GLenum,
-        view: &n::ImageView,
-    ) {
+    fn bind_target_compat(gl: &GlContainer, point: u32, attachment: u32, view: &n::ImageView) {
         match *view {
             n::ImageView::Surface(surface) => unsafe {
-                gl.FramebufferRenderbuffer(point, attachment, gl::RENDERBUFFER, surface);
+                gl.framebuffer_renderbuffer(point, attachment, glow::RENDERBUFFER, Some(surface));
             },
-            n::ImageView::Texture(texture, level) => unsafe {
-                gl.BindTexture(gl::TEXTURE_2D, texture);
-                gl.FramebufferTexture2D(point, attachment, gl::TEXTURE_2D, texture, level as _);
+            n::ImageView::Texture(texture, textype, level) => unsafe {
+                gl.bind_texture(textype, Some(texture));
+                gl.framebuffer_texture_2d(point, attachment, textype, Some(texture), level as _);
             },
-            n::ImageView::TextureLayer(texture, level, layer) => unsafe {
-                gl.BindTexture(gl::TEXTURE_2D, texture);
-                gl.FramebufferTexture3D(
-                    point,
-                    attachment,
-                    gl::TEXTURE_2D,
-                    texture,
-                    level as _,
-                    layer as _,
-                );
+            n::ImageView::TextureLayer(texture, textype, level, layer) => unsafe {
+                gl.bind_texture(textype, Some(texture));
+                gl.framebuffer_texture_3d(point, attachment, textype, Some(texture), level as _, layer as _);
             },
         }
     }
 
-    fn bind_target(gl: &GlContainer, point: GLenum, attachment: GLenum, view: &n::ImageView) {
+    fn bind_target(gl: &GlContainer, point: u32, attachment: u32, view: &n::ImageView) {
         match *view {
             n::ImageView::Surface(surface) => unsafe {
-                gl.FramebufferRenderbuffer(point, attachment, gl::RENDERBUFFER, surface);
+                gl.framebuffer_renderbuffer(point, attachment, glow::RENDERBUFFER, Some(surface));
             },
-            n::ImageView::Texture(texture, level) => unsafe {
-                gl.FramebufferTexture(point, attachment, texture, level as _);
+            n::ImageView::Texture(texture, _, level) => unsafe {
+                gl.framebuffer_texture(point, attachment, Some(texture), level as _);
             },
-            n::ImageView::TextureLayer(texture, level, layer) => unsafe {
-                gl.FramebufferTextureLayer(point, attachment, texture, level as _, layer as _);
+            n::ImageView::TextureLayer(texture, _, level, layer) => unsafe {
+                gl.framebuffer_texture_layer(point, attachment, Some(texture), level as _, layer as _);
             },
         }
     }
 
-    fn parse_spirv(&self, raw_data: &[u8]) -> Result<spirv::Ast<glsl::Target>, d::ShaderError> {
-        // spec requires "codeSize must be a multiple of 4"
-        assert_eq!(raw_data.len() & 3, 0);
-
-        let module = spirv::Module::from_words(unsafe {
-            slice::from_raw_parts(
-                raw_data.as_ptr() as *const u32,
-                raw_data.len() / mem::size_of::<u32>(),
-            )
-        });
+    fn parse_spirv(&self, raw_data: &[u32]) -> Result<spirv::Ast<glsl::Target>, d::ShaderError> {
+        let module = spirv::Module::from_words(raw_data);
 
         spirv::Ast::parse(&module).map_err(|err| {
             let msg = match err {
@@ -227,7 +148,7 @@ impl Device {
     fn specialize_ast(
         &self,
         ast: &mut spirv::Ast<glsl::Target>,
-        specialization: pso::Specialization,
+        specialization: &pso::Specialization,
     ) -> Result<(), d::ShaderError> {
         let spec_constants = ast
             .get_specialization_constants()
@@ -254,28 +175,46 @@ impl Device {
         Ok(())
     }
 
+    fn set_push_const_layout(
+        &self,
+        _ast: &mut spirv::Ast<glsl::Target>,
+    ) -> Result<(), d::ShaderError> {
+        Ok(())
+    }
+
     fn translate_spirv(
         &self,
         ast: &mut spirv::Ast<glsl::Target>,
     ) -> Result<String, d::ShaderError> {
         let mut compile_options = glsl::CompilerOptions::default();
         // see version table at https://en.wikipedia.org/wiki/OpenGL_Shading_Language
-        compile_options.version = match self.share.info.shading_language.tuple() {
-            (4, 60) => glsl::Version::V4_60,
-            (4, 50) => glsl::Version::V4_50,
-            (4, 40) => glsl::Version::V4_40,
-            (4, 30) => glsl::Version::V4_30,
-            (4, 20) => glsl::Version::V4_20,
-            (4, 10) => glsl::Version::V4_10,
-            (4, 00) => glsl::Version::V4_00,
-            (3, 30) => glsl::Version::V3_30,
-            (1, 50) => glsl::Version::V1_50,
-            (1, 40) => glsl::Version::V1_40,
-            (1, 30) => glsl::Version::V1_30,
-            (1, 20) => glsl::Version::V1_20,
-            (1, 10) => glsl::Version::V1_10,
-            other if other > (4, 60) => glsl::Version::V4_60,
-            other => panic!("GLSL version is not recognized: {:?}", other),
+        let is_embedded = self.share.info.shading_language.is_embedded;
+        let version = self.share.info.shading_language.tuple();
+        compile_options.version = if is_embedded {
+            match version {
+                (3, 00) => glsl::Version::V3_00Es,
+                (1, 00) => glsl::Version::V1_00Es,
+                other if other > (3, 00) => glsl::Version::V3_00Es,
+                other => panic!("GLSL version is not recognized: {:?}", other),
+            }
+        } else {
+            match version {
+                (4, 60) => glsl::Version::V4_60,
+                (4, 50) => glsl::Version::V4_50,
+                (4, 40) => glsl::Version::V4_40,
+                (4, 30) => glsl::Version::V4_30,
+                (4, 20) => glsl::Version::V4_20,
+                (4, 10) => glsl::Version::V4_10,
+                (4, 00) => glsl::Version::V4_00,
+                (3, 30) => glsl::Version::V3_30,
+                (1, 50) => glsl::Version::V1_50,
+                (1, 40) => glsl::Version::V1_40,
+                (1, 30) => glsl::Version::V1_30,
+                (1, 20) => glsl::Version::V1_20,
+                (1, 10) => glsl::Version::V1_10,
+                other if other > (4, 60) => glsl::Version::V4_60,
+                other => panic!("GLSL version is not recognized: {:?}", other),
+            }
         };
         compile_options.vertex.invert_y = true;
         debug!("SPIR-V options {:?}", compile_options);
@@ -429,18 +368,19 @@ impl Device {
             n::ShaderModule::Spirv(ref spirv) => {
                 let mut ast = self.parse_spirv(spirv).unwrap();
 
-                self.specialize_ast(&mut ast, point.specialization).unwrap();
+                self.specialize_ast(&mut ast, &point.specialization).unwrap();
                 self.remap_bindings(&mut ast, desc_remap_data, name_binding_map);
                 self.combine_separate_images_and_samplers(
                     &mut ast,
                     desc_remap_data,
                     name_binding_map,
                 );
+                self.set_push_const_layout(&mut ast).unwrap();
 
                 let glsl = self.translate_spirv(&mut ast).unwrap();
-                info!("Generated:\n{:?}", glsl);
+                debug!("SPIRV-Cross generated shader:\n{}", glsl);
                 let shader = match self
-                    .create_shader_module_from_source(glsl.as_bytes(), stage)
+                    .create_shader_module_from_source(&glsl, stage)
                     .unwrap()
                 {
                     n::ShaderModule::Raw(raw) => raw,
@@ -460,57 +400,58 @@ pub(crate) unsafe fn set_sampler_info<SetParamFloat, SetParamFloatVec, SetParamI
     mut set_param_float_vec: SetParamFloatVec,
     mut set_param_int: SetParamInt,
 ) where
-    SetParamFloat: FnMut(GLenum, GLfloat),
-    SetParamFloatVec: FnMut(GLenum, &[GLfloat]),
-    SetParamInt: FnMut(GLenum, GLint),
+    // TODO: Move these into a trait and implement for sampler/texture objects
+    SetParamFloat: FnMut(u32, f32),
+    SetParamFloatVec: FnMut(u32, &mut [f32]),
+    SetParamInt: FnMut(u32, i32),
 {
     let (min, mag) = conv::filter_to_gl(info.mag_filter, info.min_filter, info.mip_filter);
     match info.anisotropic {
         i::Anisotropic::On(fac) if fac > 1 => {
             if share.private_caps.sampler_anisotropy_ext {
-                set_param_float(gl::TEXTURE_MAX_ANISOTROPY_EXT, fac as GLfloat);
+                set_param_float(glow::TEXTURE_MAX_ANISOTROPY, fac as f32);
             } else if share.features.contains(c::Features::SAMPLER_ANISOTROPY) {
-                set_param_float(gl::TEXTURE_MAX_ANISOTROPY_EXT, fac as GLfloat);
+                set_param_float(glow::TEXTURE_MAX_ANISOTROPY, fac as f32);
             }
         }
         _ => (),
     }
 
-    set_param_int(gl::TEXTURE_MIN_FILTER, min as GLint);
-    set_param_int(gl::TEXTURE_MAG_FILTER, mag as GLint);
+    set_param_int(glow::TEXTURE_MIN_FILTER, min as i32);
+    set_param_int(glow::TEXTURE_MAG_FILTER, mag as i32);
 
     let (s, t, r) = info.wrap_mode;
-    set_param_int(gl::TEXTURE_WRAP_S, conv::wrap_to_gl(s) as GLint);
-    set_param_int(gl::TEXTURE_WRAP_T, conv::wrap_to_gl(t) as GLint);
-    set_param_int(gl::TEXTURE_WRAP_R, conv::wrap_to_gl(r) as GLint);
+    set_param_int(glow::TEXTURE_WRAP_S, conv::wrap_to_gl(s) as i32);
+    set_param_int(glow::TEXTURE_WRAP_T, conv::wrap_to_gl(t) as i32);
+    set_param_int(glow::TEXTURE_WRAP_R, conv::wrap_to_gl(r) as i32);
 
     if share
         .features
         .contains(hal::Features::SAMPLER_MIP_LOD_BIAS)
     {
-        set_param_float(gl::TEXTURE_LOD_BIAS, info.lod_bias.into());
+        set_param_float(glow::TEXTURE_LOD_BIAS, info.lod_bias.into());
     }
     if share
         .legacy_features
         .contains(LegacyFeatures::SAMPLER_BORDER_COLOR)
     {
-        let border: [f32; 4] = info.border.into();
-        set_param_float_vec(gl::TEXTURE_BORDER_COLOR, &border);
+        let mut border: [f32; 4] = info.border.into();
+        set_param_float_vec(glow::TEXTURE_BORDER_COLOR, &mut border);
     }
 
-    set_param_float(gl::TEXTURE_MIN_LOD, info.lod_range.start.into());
-    set_param_float(gl::TEXTURE_MAX_LOD, info.lod_range.end.into());
+    set_param_float(glow::TEXTURE_MIN_LOD, info.lod_range.start.into());
+    set_param_float(glow::TEXTURE_MAX_LOD, info.lod_range.end.into());
 
     match info.comparison {
-        None => set_param_int(gl::TEXTURE_COMPARE_MODE, gl::NONE as GLint),
+        None => set_param_int(glow::TEXTURE_COMPARE_MODE, glow::NONE as i32),
         Some(cmp) => {
             set_param_int(
-                gl::TEXTURE_COMPARE_MODE,
-                gl::COMPARE_REF_TO_TEXTURE as GLint,
+                glow::TEXTURE_COMPARE_MODE,
+                glow::COMPARE_REF_TO_TEXTURE as i32,
             );
             set_param_int(
-                gl::TEXTURE_COMPARE_FUNC,
-                state::map_comparison(cmp) as GLint,
+                glow::TEXTURE_COMPARE_FUNC,
+                state::map_comparison(cmp) as i32,
             );
         }
     }
@@ -519,15 +460,95 @@ pub(crate) unsafe fn set_sampler_info<SetParamFloat, SetParamFloatVec, SetParamI
 impl d::Device<B> for Device {
     unsafe fn allocate_memory(
         &self,
-        _mem_type: c::MemoryTypeId,
+        mem_type: c::MemoryTypeId,
         size: u64,
     ) -> Result<n::Memory, d::AllocationError> {
-        // TODO
-        Ok(n::Memory {
-            properties: memory::Properties::CPU_VISIBLE | memory::Properties::CPU_CACHED,
-            first_bound_buffer: Cell::new(0),
-            size,
-        })
+        let (memory_type, memory_role) = self.share.memory_types[mem_type.0 as usize];
+
+        let is_device_local_memory = memory_type.properties.contains(memory::Properties::DEVICE_LOCAL);
+        let is_cpu_visible_memory = memory_type.properties.contains(memory::Properties::CPU_VISIBLE);
+        let is_coherent_memory = memory_type.properties.contains(memory::Properties::COHERENT);
+        let is_readable_memory = memory_type.properties.contains(memory::Properties::CPU_CACHED);
+
+        match memory_role {
+            MemoryUsage::Buffer(buffer_usage) => {
+                let gl = &self.share.context;
+                let target = if buffer_usage.contains(buffer::Usage::INDEX)
+                    && !self.share.private_caps.index_buffer_role_change {
+                    glow::ELEMENT_ARRAY_BUFFER
+                } else {
+                    glow::ARRAY_BUFFER
+                };
+
+                let raw = gl.create_buffer().unwrap();
+                //TODO: use *Named calls to avoid binding
+                gl.bind_buffer(target, Some(raw));
+
+                let mut map_flags = 0;
+
+                if is_cpu_visible_memory {
+                    map_flags |= glow::MAP_WRITE_BIT | glow::MAP_FLUSH_EXPLICIT_BIT;
+                    if is_readable_memory {
+                        map_flags |= glow::MAP_READ_BIT;
+                    }
+                }
+
+                if self.share.private_caps.buffer_storage {
+                    let mut storage_flags = 0;
+
+                    if is_cpu_visible_memory {
+                        map_flags |= glow::MAP_PERSISTENT_BIT;
+                        storage_flags |= glow::MAP_WRITE_BIT
+                            | glow::MAP_PERSISTENT_BIT
+                            | glow::DYNAMIC_STORAGE_BIT;
+
+                        if is_readable_memory {
+                            storage_flags |= glow::MAP_READ_BIT;
+                        }
+
+                        if is_coherent_memory {
+                            map_flags |= glow::MAP_COHERENT_BIT;
+                            storage_flags |= glow::MAP_COHERENT_BIT;
+                        }
+                    }
+
+                    gl.buffer_storage(target, size as i32, None, storage_flags);
+                } else {
+                    assert!(!is_coherent_memory);
+                    let usage = if is_cpu_visible_memory {
+                        glow::DYNAMIC_DRAW
+                    } else {
+                        glow::STATIC_DRAW
+                    };
+                    gl.buffer_data_size(target, size as i32, usage);
+                }
+
+                gl.bind_buffer(target, None);
+
+                if let Err(err) = self.share.check() {
+                    panic!("Error allocating memory buffer {:?}", err);
+                }
+
+                Ok(n::Memory {
+                    properties: memory_type.properties,
+                    buffer: Some((raw, target)),
+                    size,
+                    map_flags,
+                    emulate_map_allocation: Cell::new(None),
+                })
+            }
+
+            MemoryUsage::Image => {
+                assert!(is_device_local_memory);
+                Ok(n::Memory {
+                    properties: memory::Properties::DEVICE_LOCAL,
+                    buffer: None,
+                    size,
+                    map_flags: 0,
+                    emulate_map_allocation: Cell::new(None),
+                })
+            }
+        }
     }
 
     unsafe fn create_command_pool(
@@ -558,7 +579,7 @@ impl d::Device<B> for Device {
     unsafe fn destroy_command_pool(&self, pool: RawCommandPool) {
         if let Some(fbo) = pool.fbo {
             let gl = &self.share.context;
-            gl.DeleteFramebuffers(1, &fbo);
+            gl.delete_framebuffer(fbo);
         }
     }
 
@@ -579,14 +600,15 @@ impl d::Device<B> for Device {
         let subpasses = subpasses
             .into_iter()
             .map(|subpass| {
-                let color_attachments = subpass
-                    .borrow()
-                    .colors
-                    .iter()
-                    .map(|&(index, _)| index)
-                    .collect();
+                let subpass = subpass.borrow();
+                let color_attachments = subpass.colors.iter().map(|&(index, _)| index).collect();
 
-                n::SubpassDesc { color_attachments }
+                let depth_stencil = subpass.depth_stencil.map(|ds| ds.0);
+
+                n::SubpassDesc {
+                    color_attachments,
+                    depth_stencil,
+                }
             })
             .collect();
 
@@ -624,7 +646,7 @@ impl d::Device<B> for Device {
                 // StorageTexel -> StorageTexel
 
                 assert!(!binding.immutable_samplers); //TODO: Implement immutable_samplers
-                use pso::DescriptorType::*;
+                use crate::pso::DescriptorType::*;
                 match binding.ty {
                     CombinedImageSampler => {
                         drd.insert_missing_binding_into_spare(
@@ -660,7 +682,7 @@ impl d::Device<B> for Device {
         Ok(())
     }
 
-    unsafe fn get_pipeline_cache_data(&self, cache: &()) -> Result<Vec<u8>, d::OutOfMemory> {
+    unsafe fn get_pipeline_cache_data(&self, _cache: &()) -> Result<Vec<u8>, d::OutOfMemory> {
         //empty
         Ok(Vec::new())
     }
@@ -695,7 +717,7 @@ impl d::Device<B> for Device {
         };
 
         let program = {
-            let name = gl.CreateProgram();
+            let name = gl.create_program().unwrap();
 
             // Attach shaders to program
             let shaders = [
@@ -717,9 +739,7 @@ impl d::Device<B> for Device {
                             &mut desc.layout.desc_remap_data.write().unwrap(),
                             &mut name_binding_map,
                         );
-
-                        gl.AttachShader(name, shader_name);
-
+                        gl.attach_shader(name, shader_name);
                         shader_name
                     })
                 })
@@ -728,23 +748,19 @@ impl d::Device<B> for Device {
             if !share.private_caps.program_interface && share.private_caps.frag_data_location {
                 for i in 0..subpass.color_attachments.len() {
                     let color_name = format!("Target{}\0", i);
-                    gl.BindFragDataLocation(
-                        name,
-                        i as u32,
-                        (&color_name[..]).as_ptr() as *mut gl::types::GLchar,
-                    );
+                    gl.bind_frag_data_location(name, i as u32, color_name.as_str());
                 }
             }
 
-            gl.LinkProgram(name);
-            info!("\tLinked program {}", name);
+            gl.link_program(name);
+            info!("\tLinked program {:?}", name);
             if let Err(err) = share.check() {
                 panic!("Error linking program: {:?}", err);
             }
 
             for shader_name in shader_names {
-                gl.DetachShader(name, *shader_name);
-                gl.DeleteShader(*shader_name);
+                gl.detach_shader(name, *shader_name);
+                gl.delete_shader(*shader_name);
             }
 
             if !self
@@ -753,16 +769,16 @@ impl d::Device<B> for Device {
                 .contains(LegacyFeatures::EXPLICIT_LAYOUTS_IN_SHADER)
             {
                 let gl = &self.share.context;
-                gl.UseProgram(name);
+                gl.use_program(Some(name));
                 for (bname, binding) in name_binding_map.iter() {
-                    let loc = gl.GetUniformLocation(name, bname.as_ptr() as _);
-                    gl.Uniform1i(loc, *binding as _);
+                    let loc = gl.get_uniform_location(name, bname);
+                    gl.uniform_1_i32(loc, *binding as _);
                 }
             }
 
-            let status = get_program_iv(gl, name, gl::LINK_STATUS);
-            let log = get_program_log(gl, name);
-            if status != 0 {
+            let linked_ok = gl.get_program_link_status(name);
+            let log = gl.get_program_info_log(name);
+            if linked_ok {
                 if !log.is_empty() {
                     warn!("\tLog: {}", log);
                 }
@@ -788,6 +804,34 @@ impl d::Device<B> for Device {
             vertex_buffers[vb.binding as usize] = Some(*vb);
         }
 
+        let mut uniforms = Vec::new();
+        {
+            let gl = &self.share.context;
+            let count = gl.get_active_uniforms(program);
+
+            let mut offset = 0;
+
+            for uniform in 0..count {
+                let glow::ActiveUniform {
+                    size,
+                    utype,
+                    name,
+                } = gl.get_active_uniform(program, uniform).unwrap();
+
+                let location = gl.get_uniform_location(program, &name).unwrap();
+
+                // Sampler2D won't show up in UniformLocation and the only other uniforms
+                // should be push constants
+                uniforms.push(n::UniformDesc {
+                    location: location as _,
+                    offset,
+                    utype,
+                });
+
+                offset += size as u32;
+            }
+        }
+
         Ok(n::GraphicsPipeline {
             program,
             primitive: conv::primitive_to_gl_primitive(desc.input_assembler.primitive),
@@ -810,6 +854,9 @@ impl d::Device<B> for Device {
                     }
                 })
                 .collect(),
+            uniforms,
+            rasterizer: desc.rasterizer,
+            depth: desc.depth_stencil.depth,
         })
     }
 
@@ -822,7 +869,7 @@ impl d::Device<B> for Device {
         let share = &self.share;
 
         let program = {
-            let name = gl.CreateProgram();
+            let name = gl.create_program().unwrap();
 
             let mut name_binding_map = FastHashMap::<String, pso::DescriptorBinding>::default();
             let shader = self.compile_shader(
@@ -831,16 +878,16 @@ impl d::Device<B> for Device {
                 &mut desc.layout.desc_remap_data.write().unwrap(),
                 &mut name_binding_map,
             );
-            gl.AttachShader(name, shader);
 
-            gl.LinkProgram(name);
-            info!("\tLinked program {}", name);
+            gl.attach_shader(name, shader);
+            gl.link_program(name);
+            info!("\tLinked program {:?}", name);
             if let Err(err) = share.check() {
                 panic!("Error linking program: {:?}", err);
             }
 
-            gl.DetachShader(name, shader);
-            gl.DeleteShader(shader);
+            gl.detach_shader(name, shader);
+            gl.delete_shader(shader);
 
             if !self
                 .share
@@ -848,16 +895,16 @@ impl d::Device<B> for Device {
                 .contains(LegacyFeatures::EXPLICIT_LAYOUTS_IN_SHADER)
             {
                 let gl = &self.share.context;
-                gl.UseProgram(name);
+                gl.use_program(Some(name));
                 for (bname, binding) in name_binding_map.iter() {
-                    let loc = gl.GetUniformLocation(name, bname.as_ptr() as _);
-                    gl.Uniform1i(loc, *binding as _);
+                    let loc = gl.get_uniform_location(name, bname);
+                    gl.uniform_1_i32(loc, *binding as _);
                 }
             }
 
-            let status = get_program_iv(gl, name, gl::LINK_STATUS);
-            let log = get_program_log(gl, name);
-            if status != 0 {
+            let linked_ok = gl.get_program_link_status(name);
+            let log = gl.get_program_info_log(name);
+            if linked_ok {
                 if !log.is_empty() {
                     warn!("\tLog: {}", log);
                 }
@@ -876,7 +923,7 @@ impl d::Device<B> for Device {
         pass: &n::RenderPass,
         attachments: I,
         _extent: i::Extent,
-    ) -> Result<n::FrameBuffer, d::OutOfMemory>
+    ) -> Result<Option<n::FrameBuffer>, d::OutOfMemory>
     where
         I: IntoIterator,
         I::Item: Borrow<n::ImageView>,
@@ -886,35 +933,57 @@ impl d::Device<B> for Device {
         }
 
         let gl = &self.share.context;
-        let target = gl::DRAW_FRAMEBUFFER;
-        let mut name = 0;
-        gl.GenFramebuffers(1, &mut name);
-        gl.BindFramebuffer(target, name);
+        let target = glow::DRAW_FRAMEBUFFER;
+        let name = gl.create_framebuffer().unwrap();
+        gl.bind_framebuffer(target, Some(name));
 
-        let att_points = [
-            gl::COLOR_ATTACHMENT0,
-            gl::COLOR_ATTACHMENT1,
-            gl::COLOR_ATTACHMENT2,
-            gl::COLOR_ATTACHMENT3,
-        ];
+        let mut render_attachments = Vec::with_capacity(pass.attachments.len());
+        let mut color_attachment_index = 0;
+        for attachment in &pass.attachments {
+            if color_attachment_index > self.share.limits.framebuffer_color_samples_count as _ {
+                panic!(
+                    "Invalid number of color attachments: {} color_attachment of {}",
+                    color_attachment_index, self.share.limits.framebuffer_color_samples_count
+                );
+            }
 
-        let mut attachments_len = 0;
-        //TODO: exclude depth/stencil attachments from here
-        for (&att_point, view) in att_points.iter().zip(attachments.into_iter()) {
-            attachments_len += 1;
-            if self.share.private_caps.framebuffer_texture {
-                Self::bind_target(gl, target, att_point, view.borrow());
-            } else {
-                Self::bind_target_compat(gl, target, att_point, view.borrow());
+            let color_attachment = color_attachment_index + glow::COLOR_ATTACHMENT0;
+            if color_attachment > glow::COLOR_ATTACHMENT31 {
+                panic!("Invalid attachment -- this shouldn't happen!");
+            };
+
+            match attachment.format {
+                Some(Format::Rgba8Unorm) => {
+                    render_attachments.push(color_attachment);
+                    color_attachment_index += 1;
+                }
+                Some(Format::Bgra8Unorm) => {
+                    render_attachments.push(color_attachment);
+                    color_attachment_index += 1;
+                }
+                Some(Format::Rgba8Srgb) => {
+                    render_attachments.push(color_attachment);
+                    color_attachment_index += 1;
+                }
+                Some(Format::D32Sfloat) => render_attachments.push(glow::DEPTH_STENCIL_ATTACHMENT),
+                _ => unimplemented!(),
             }
         }
-        assert_eq!(attachments_len, pass.attachments.len());
-        // attachments_len actually equals min(attachments.len(), att_points.len()) until the next assert
 
-        assert!(pass.attachments.len() <= att_points.len());
-        gl.DrawBuffers(attachments_len as _, att_points.as_ptr());
-        let _status = gl.CheckFramebufferStatus(target); //TODO: check status
-        gl.BindFramebuffer(target, 0);
+        let mut attachments_len = 0;
+        for (&render_attachment, view) in render_attachments.iter().zip(attachments.into_iter()) {
+            attachments_len += 1;
+            if self.share.private_caps.framebuffer_texture {
+                Self::bind_target(gl, target, render_attachment, view.borrow());
+            } else {
+                Self::bind_target_compat(gl, target, render_attachment, view.borrow());
+            }
+        }
+
+        assert!(pass.attachments.len() <= attachments_len);
+
+        let _status = gl.check_framebuffer_status(target); //TODO: check status
+        gl.bind_framebuffer(target, None);
 
         if let Err(err) = self.share.check() {
             //TODO: attachments have been consumed
@@ -924,12 +993,12 @@ impl d::Device<B> for Device {
             );
         }
 
-        Ok(name)
+        Ok(Some(name))
     }
 
     unsafe fn create_shader_module(
         &self,
-        raw_data: &[u8],
+        raw_data: &[u32],
     ) -> Result<n::ShaderModule, d::ShaderError> {
         Ok(n::ShaderModule::Spirv(raw_data.into()))
     }
@@ -947,15 +1016,14 @@ impl d::Device<B> for Device {
         }
 
         let gl = &self.share.context;
-        let mut name = 0 as n::Sampler;
 
-        gl.GenSamplers(1, &mut name);
+        let name = gl.create_sampler().unwrap();
         set_sampler_info(
             &self.share,
             &info,
-            |a, b| gl.SamplerParameterf(name, a, b),
-            |a, b| gl.SamplerParameterfv(name, a, &b[0]),
-            |a, b| gl.SamplerParameteri(name, a, b),
+            |a, b| gl.sampler_parameter_f32(name, a, b),
+            |a, b| gl.sampler_parameter_f32_slice(name, a, b),
+            |a, b| gl.sampler_parameter_i32(name, a, b),
         );
 
         if let Err(_) = self.share.check() {
@@ -981,32 +1049,25 @@ impl d::Device<B> for Device {
             return Err(buffer::CreationError::UnsupportedUsage { usage });
         }
 
-        let target = if self.share.private_caps.buffer_role_change {
-            gl::ARRAY_BUFFER
-        } else {
-            match conv::buffer_usage_to_gl_target(usage) {
-                Some(target) => target,
-                None => return Err(buffer::CreationError::UnsupportedUsage { usage }),
-            }
-        };
-
-        let gl = &self.share.context;
-        let mut name = 0;
-        gl.GenBuffers(1, &mut name);
-
-        Ok(n::Buffer {
-            raw: name,
-            target,
-            requirements: memory::Requirements {
-                size,
-                alignment: 1, // TODO: do we need specific alignment for any use-case?
-                type_mask: 0x7,
-            },
+        Ok(n::Buffer::Unbound {
+            size,
+            usage,
         })
     }
 
     unsafe fn get_buffer_requirements(&self, buffer: &n::Buffer) -> memory::Requirements {
-        buffer.requirements
+        let (size, usage) = match *buffer {
+            n::Buffer::Unbound { size, usage } => (size, usage),
+            n::Buffer::Bound { .. } => panic!("Unexpected Buffer::Bound"),
+        };
+
+        memory::Requirements {
+            size: size as u64,
+            // Alignment of 4 covers indexes of type u16 and u32 in index buffers, which is
+            // currently the only alignment requirement.
+            alignment: 4,
+            type_mask: self.share.buffer_memory_type_mask(usage),
+        }
     }
 
     unsafe fn bind_buffer_memory(
@@ -1015,46 +1076,15 @@ impl d::Device<B> for Device {
         offset: u64,
         buffer: &mut n::Buffer,
     ) -> Result<(), d::BindError> {
-        let gl = &self.share.context;
-        let target = buffer.target;
+        let size = match *buffer {
+            n::Buffer::Unbound { size, .. } => size,
+            n::Buffer::Bound { .. } => panic!("Unexpected Buffer::Bound"),
+        };
 
-        if offset == 0 {
-            memory.first_bound_buffer.set(buffer.raw);
-        } else {
-            assert_ne!(0, memory.first_bound_buffer.get());
-        }
-
-        let cpu_can_read = memory.can_download();
-        let cpu_can_write = memory.can_upload();
-
-        if self.share.private_caps.buffer_storage {
-            //TODO: gl::DYNAMIC_STORAGE_BIT | gl::MAP_PERSISTENT_BIT
-            let flags = memory.map_flags();
-            //TODO: use *Named calls to avoid binding
-            gl.BindBuffer(target, buffer.raw);
-            gl.BufferStorage(target, buffer.requirements.size as _, ptr::null(), flags);
-            gl.BindBuffer(target, 0);
-        } else {
-            let flags = if cpu_can_read && cpu_can_write {
-                gl::DYNAMIC_DRAW
-            } else if cpu_can_write {
-                gl::STREAM_DRAW
-            } else if cpu_can_read {
-                gl::STREAM_READ
-            } else {
-                gl::STATIC_DRAW
-            };
-            gl.BindBuffer(target, buffer.raw);
-            gl.BufferData(target, buffer.requirements.size as _, ptr::null(), flags);
-            gl.BindBuffer(target, 0);
-        }
-
-        if let Err(err) = self.share.check() {
-            panic!(
-                "Error {:?} initializing buffer {:?}, memory {:?}",
-                err, buffer, memory.properties
-            );
-        }
+        *buffer = n::Buffer::Bound {
+            buffer: memory.buffer.expect("Improper memory type used for buffer memory").0,
+            range: offset..offset + size,
+        };
 
         Ok(())
     }
@@ -1065,23 +1095,27 @@ impl d::Device<B> for Device {
         range: R,
     ) -> Result<*mut u8, mapping::Error> {
         let gl = &self.share.context;
-        let buffer = match memory.first_bound_buffer.get() {
-            0 => panic!("No buffer has been bound yet, can't map memory!"),
-            other => other,
-        };
-
-        assert!(self.share.private_caps.buffer_role_change);
-        let target = gl::PIXEL_PACK_BUFFER;
-        let access = memory.map_flags();
+        let caps = &self.share.private_caps;
 
         let offset = *range.start().unwrap_or(&0);
         let size = *range.end().unwrap_or(&memory.size) - offset;
 
-        let ptr = {
-            gl.BindBuffer(target, buffer);
-            let ptr = gl.MapBufferRange(target, offset as _, size as _, access);
-            gl.BindBuffer(target, 0);
-            ptr as *mut _
+        let (buffer, target) = memory.buffer.expect("cannot map image memory");
+        let ptr = if caps.emulate_map {
+            let ptr: *mut u8 = if let Some(ptr) = memory.emulate_map_allocation.get() {
+                ptr
+            } else {
+                let ptr = Box::into_raw(vec![0; memory.size as usize].into_boxed_slice()) as *mut u8;
+                memory.emulate_map_allocation.set(Some(ptr));
+                ptr
+            };
+
+            ptr.offset(offset as isize)
+        } else {
+            gl.bind_buffer(target, Some(buffer));
+            let raw = gl.map_buffer_range(target, offset as i32, size as i32, memory.map_flags);
+            gl.bind_buffer(target, None);
+            raw
         };
 
         if let Err(err) = self.share.check() {
@@ -1093,41 +1127,90 @@ impl d::Device<B> for Device {
 
     unsafe fn unmap_memory(&self, memory: &n::Memory) {
         let gl = &self.share.context;
-        let buffer = match memory.first_bound_buffer.get() {
-            0 => panic!("No buffer has been bound yet, can't map memory!"),
-            other => other,
-        };
-        let target = gl::PIXEL_PACK_BUFFER;
+        let (buffer, target) = memory.buffer.expect("cannot unmap image memory");
 
-        gl.BindBuffer(target, buffer);
-        gl.UnmapBuffer(target);
-        gl.BindBuffer(target, 0);
+        gl.bind_buffer(target, Some(buffer));
+
+        if self.share.private_caps.emulate_map {
+            let ptr = memory.emulate_map_allocation.replace(None).unwrap();
+            let _ = Box::from_raw(slice::from_raw_parts_mut(ptr, memory.size as usize));
+        } else {
+            gl.unmap_buffer(target);
+        }
+
+        gl.bind_buffer(target, None);
 
         if let Err(err) = self.share.check() {
             panic!("Error unmapping memory: {:?} for memory {:?}", err, memory);
         }
     }
 
-    unsafe fn flush_mapped_memory_ranges<'a, I, R>(&self, _: I) -> Result<(), d::OutOfMemory>
+    unsafe fn flush_mapped_memory_ranges<'a, I, R>(&self, ranges: I) -> Result<(), d::OutOfMemory>
     where
         I: IntoIterator,
         I::Item: Borrow<(&'a n::Memory, R)>,
         R: RangeArg<u64>,
     {
-        warn!("memory range invalidation not implemented!");
+        let gl = &self.share.context;
+
+        for i in ranges {
+            let (mem, range) = i.borrow();
+            let (buffer, target) = mem.buffer.expect("cannot flush image memory");
+            gl.bind_buffer(target, Some(buffer));
+
+            let offset = *range.start().unwrap_or(&0);
+            let size = *range.end().unwrap_or(&mem.size) - offset;
+
+            if self.share.private_caps.emulate_map {
+                let ptr = mem.emulate_map_allocation.get().unwrap();
+                let slice = slice::from_raw_parts_mut(ptr.offset(offset as isize), size as usize);
+                gl.buffer_sub_data_u8_slice(target, offset as i32, slice);
+            } else {
+                gl.flush_mapped_buffer_range(target, offset as i32, size as i32);
+            }
+            gl.bind_buffer(target, None);
+            if let Err(err) = self.share.check() {
+                panic!("Error flushing memory range: {:?} for memory {:?}", err, mem);
+            }
+        }
+
         Ok(())
     }
 
     unsafe fn invalidate_mapped_memory_ranges<'a, I, R>(
         &self,
-        _ranges: I,
+        ranges: I,
     ) -> Result<(), d::OutOfMemory>
     where
         I: IntoIterator,
         I::Item: Borrow<(&'a n::Memory, R)>,
         R: RangeArg<u64>,
     {
-        unimplemented!()
+        let gl = &self.share.context;
+
+        for i in ranges {
+            let (mem, range) = i.borrow();
+            let (buffer, target) = mem.buffer.expect("cannot invalidate image memory");
+            gl.bind_buffer(target, Some(buffer));
+
+            let offset = *range.start().unwrap_or(&0);
+            let size = *range.end().unwrap_or(&mem.size) - offset;
+
+            if self.share.private_caps.emulate_map {
+                let ptr = mem.emulate_map_allocation.get().unwrap();
+                let slice = slice::from_raw_parts_mut(ptr.offset(offset as isize), size as usize);
+                gl.get_buffer_sub_data(target, offset as i32, slice);
+            } else {
+                gl.invalidate_buffer_sub_data(target, offset as i32, size as i32);
+                gl.bind_buffer(target, None);
+            }
+
+            if let Err(err) = self.share.check() {
+                panic!("Error invalidating memory range: {:?} for memory {:?}", err, mem);
+            }
+        }
+
+        Ok(())
     }
 
     unsafe fn create_buffer_view<R: RangeArg<u64>>(
@@ -1151,9 +1234,15 @@ impl d::Device<B> for Device {
         let gl = &self.share.context;
 
         let (int_format, iformat, itype) = match format {
-            Format::Rgba8Unorm => (gl::RGBA8, gl::RGBA, gl::UNSIGNED_BYTE),
-            Format::Rgba8Srgb => (gl::SRGB8_ALPHA8, gl::RGBA, gl::UNSIGNED_BYTE),
-            _ => unimplemented!(),
+            Format::Rgba8Unorm => (glow::RGBA8, glow::RGBA, glow::UNSIGNED_BYTE),
+            Format::Bgra8Unorm => (glow::RGBA8, glow::BGRA, glow::UNSIGNED_BYTE),
+            Format::Rgba8Srgb => (glow::SRGB8_ALPHA8, glow::RGBA, glow::UNSIGNED_BYTE),
+            Format::D32Sfloat => (
+                glow::DEPTH32F_STENCIL8,
+                glow::DEPTH_STENCIL,
+                glow::FLOAT_32_UNSIGNED_INT_24_8_REV,
+            ),
+            _ => unimplemented!()
         };
 
         let channel = format.base_format().1;
@@ -1162,30 +1251,29 @@ impl d::Device<B> for Device {
             || usage.contains(i::Usage::STORAGE)
             || usage.contains(i::Usage::SAMPLED)
         {
-            let mut name = 0;
-            gl.GenTextures(1, &mut name);
+            let name = gl.create_texture().unwrap();
             match kind {
                 i::Kind::D2(w, h, 1, 1) => {
-                    gl.BindTexture(gl::TEXTURE_2D, name);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(name));
                     if self.share.private_caps.image_storage {
-                        gl.TexStorage2D(
-                            gl::TEXTURE_2D,
+                        gl.tex_storage_2d(
+                            glow::TEXTURE_2D,
                             num_levels as _,
                             int_format,
                             w as _,
                             h as _,
                         );
                     } else {
-                        gl.TexParameteri(
-                            gl::TEXTURE_2D,
-                            gl::TEXTURE_MAX_LEVEL,
+                        gl.tex_parameter_i32(
+                            glow::TEXTURE_2D,
+                            glow::TEXTURE_MAX_LEVEL,
                             (num_levels - 1) as _,
                         );
                         let mut w = w;
                         let mut h = h;
                         for i in 0..num_levels {
-                            gl.TexImage2D(
-                                gl::TEXTURE_2D,
+                            gl.tex_image_2d(
+                                glow::TEXTURE_2D,
                                 i as _,
                                 int_format as _,
                                 w as _,
@@ -1193,23 +1281,70 @@ impl d::Device<B> for Device {
                                 0,
                                 iformat,
                                 itype,
-                                std::ptr::null(),
+                                None,
                             );
                             w = std::cmp::max(w / 2, 1);
                             h = std::cmp::max(h / 2, 1);
                         }
                     }
+                    n::ImageKind::Texture {
+                        texture: name,
+                        target: glow::TEXTURE_2D, 
+                        format: iformat,
+                        pixel_type: itype,
+                    }
+                }
+                i::Kind::D2(w, h, l, 1) => {
+                    gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(name));
+                    if self.share.private_caps.image_storage {
+                        gl.tex_storage_3d(
+                            glow::TEXTURE_2D_ARRAY,
+                            num_levels as _,
+                            int_format,
+                            w as _,
+                            h as _,
+                            l as _,
+                        );
+                    } else {
+                        gl.tex_parameter_i32(
+                            glow::TEXTURE_2D_ARRAY,
+                            glow::TEXTURE_MAX_LEVEL,
+                            (num_levels - 1) as _,
+                        );
+                        let mut w = w;
+                        let mut h = h;
+                        for i in 0..num_levels {
+                            gl.tex_image_3d(
+                                glow::TEXTURE_2D_ARRAY,
+                                i as _,
+                                int_format as _,
+                                w as _,
+                                h as _,
+                                l as _,
+                                0,
+                                iformat,
+                                itype,
+                                None,
+                            );
+                            w = std::cmp::max(w / 2, 1);
+                            h = std::cmp::max(h / 2, 1);
+                        }
+                    }
+                    n::ImageKind::Texture {
+                        texture: name,
+                        target: glow::TEXTURE_2D_ARRAY, 
+                        format: iformat,
+                        pixel_type: itype,
+                    }
                 }
                 _ => unimplemented!(),
-            };
-            n::ImageKind::Texture(name)
+            }
         } else {
-            let mut name = 0;
-            gl.GenRenderbuffers(1, &mut name);
+            let name = gl.create_renderbuffer().unwrap();
             match kind {
                 i::Kind::D2(w, h, 1, 1) => {
-                    gl.BindRenderbuffer(gl::RENDERBUFFER, name);
-                    gl.RenderbufferStorage(gl::RENDERBUFFER, int_format, w as _, h as _);
+                    gl.bind_renderbuffer(glow::RENDERBUFFER, Some(name));
+                    gl.renderbuffer_storage(glow::RENDERBUFFER, int_format, w as _, h as _);
                 }
                 _ => unimplemented!(),
             };
@@ -1220,6 +1355,7 @@ impl d::Device<B> for Device {
         let bytes_per_texel = surface_desc.bits / 8;
         let ext = kind.extent();
         let size = (ext.width * ext.height * ext.depth) as u64 * bytes_per_texel as u64;
+        let type_mask = self.share.image_memory_type_mask();
 
         if let Err(err) = self.share.check() {
             panic!(
@@ -1234,7 +1370,7 @@ impl d::Device<B> for Device {
             requirements: memory::Requirements {
                 size,
                 alignment: 1,
-                type_mask: 0x7,
+                type_mask,
             },
         })
     }
@@ -1286,13 +1422,14 @@ impl d::Device<B> for Device {
                     )))
                 }
             }
-            n::ImageKind::Texture(texture) => {
+            n::ImageKind::Texture { texture, target, .. } => {
                 //TODO: check that `level` exists
                 if range.layers.start == 0 {
-                    Ok(n::ImageView::Texture(texture, level))
+                    Ok(n::ImageView::Texture(texture, target, level))
                 } else if range.layers.start + 1 == range.layers.end {
                     Ok(n::ImageView::TextureLayer(
                         texture,
+                        target,
                         level,
                         range.layers.start,
                     ))
@@ -1309,6 +1446,7 @@ impl d::Device<B> for Device {
         &self,
         _: usize,
         _: I,
+        _: pso::DescriptorPoolCreateFlags,
     ) -> Result<n::DescriptorPool, d::OutOfMemory>
     where
         I: IntoIterator,
@@ -1342,20 +1480,21 @@ impl d::Device<B> for Device {
             let set = &mut write.set;
             let mut bindings = set.bindings.lock().unwrap();
             let binding = write.binding;
-            let mut offset = write.array_offset as _;
+            let mut offset = write.array_offset as i32;
 
             for descriptor in write.descriptors {
                 match descriptor.borrow() {
                     pso::Descriptor::Buffer(buffer, ref range) => {
-                        let start = range.start.unwrap_or(0);
-                        let end = range.end.unwrap_or(buffer.requirements.size);
-                        let size = (end - start) as _;
+                        let (raw_buffer, buffer_range) = buffer.as_bound();
+                        let start = buffer_range.start as i32 + range.start.unwrap_or(0) as i32;
+                        let end = buffer_range.start as i32 + range.end.unwrap_or((buffer_range.end - buffer_range.start) as u64) as i32;
+                        let size = end - start;
 
                         bindings.push(n::DescSetBindings::Buffer {
                             ty: n::BindingTypes::UniformBuffers,
                             binding,
-                            buffer: buffer.raw,
-                            offset,
+                            buffer: raw_buffer,
+                            offset: offset + start,
                             size,
                         });
 
@@ -1363,9 +1502,9 @@ impl d::Device<B> for Device {
                     }
                     pso::Descriptor::CombinedImageSampler(view, _layout, sampler) => {
                         match view {
-                            n::ImageView::Texture(tex, _)
-                            | n::ImageView::TextureLayer(tex, _, _) => {
-                                bindings.push(n::DescSetBindings::Texture(binding, *tex))
+                            n::ImageView::Texture(tex, textype, _)
+                            | n::ImageView::TextureLayer(tex, textype, _, _) => {
+                                bindings.push(n::DescSetBindings::Texture(binding, *tex, *textype))
                             }
                             n::ImageView::Surface(_) => unimplemented!(),
                         }
@@ -1378,8 +1517,8 @@ impl d::Device<B> for Device {
                         }
                     }
                     pso::Descriptor::Image(view, _layout) => match view {
-                        n::ImageView::Texture(tex, _) | n::ImageView::TextureLayer(tex, _, _) => {
-                            bindings.push(n::DescSetBindings::Texture(binding, *tex))
+                        n::ImageView::Texture(tex, textype, _) | n::ImageView::TextureLayer(tex, textype, _, _) => {
+                            bindings.push(n::DescSetBindings::Texture(binding, *tex, *textype))
                         }
                         n::ImageView::Surface(_) => panic!(
                             "Texture was created with only render target usage which is invalid."
@@ -1414,32 +1553,13 @@ impl d::Device<B> for Device {
         Ok(n::Semaphore)
     }
 
-    fn create_fence(&self, signalled: bool) -> Result<n::Fence, d::OutOfMemory> {
-        let sync = if signalled && self.share.private_caps.sync {
-            let gl = &self.share.context;
-            unsafe { gl.FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0) }
-        } else {
-            ptr::null()
-        };
-        Ok(n::Fence::new(sync))
+    fn create_fence(&self, signaled: bool) -> Result<n::Fence, d::OutOfMemory> {
+        let cell = Cell::new(n::FenceInner::Idle { signaled });
+        Ok(n::Fence(cell))
     }
 
-    unsafe fn reset_fences<I>(&self, fences: I) -> Result<(), d::OutOfMemory>
-    where
-        I: IntoIterator,
-        I::Item: Borrow<n::Fence>,
-    {
-        let gl = &self.share.context;
-        for fence in fences {
-            let fence = fence.borrow();
-            let sync = fence.0.get();
-            if !sync.is_null() {
-                if self.share.private_caps.sync && gl.IsSync(sync) == gl::TRUE {
-                    gl.DeleteSync(sync);
-                }
-            }
-            fence.0.set(ptr::null())
-        }
+    unsafe fn reset_fence(&self, fence: &n::Fence) -> Result<(), d::OutOfMemory> {
+        fence.0.replace(n::FenceInner::Idle { signaled: false });
         Ok(())
     }
 
@@ -1448,27 +1568,128 @@ impl d::Device<B> for Device {
         fence: &n::Fence,
         timeout_ns: u64,
     ) -> Result<bool, d::OomOrDeviceLost> {
-        if !self.share.private_caps.sync {
-            return Ok(true);
-        }
-        match wait_fence(fence, &self.share, timeout_ns) {
-            gl::TIMEOUT_EXPIRED => Ok(false),
-            gl::WAIT_FAILED => {
-                if let Err(err) = self.share.check() {
-                    error!("Error when waiting on fence: {:?}", err);
+        // TODO:
+        // This can be called by multiple objects wanting to ensure they have exclusive
+        // access to a resource. How much does this call costs ? The status of the fence
+        // could be cached to avoid calling this more than once (in core or in the backend ?).
+        let gl = &self.share.context;
+        match fence.0.get() {
+            n::FenceInner::Idle { signaled } => {
+                if !signaled {
+                    warn!("Fence ptr {:?} is not pending, waiting not possible", fence.0.as_ptr());
                 }
-                Ok(false)
+                Ok(signaled)
             }
-            _ => Ok(true),
+            n::FenceInner::Pending(Some(sync)) => {
+                // TODO: Could `wait_sync` be used here instead?
+                match gl.client_wait_sync(
+                    sync,
+                    glow::SYNC_FLUSH_COMMANDS_BIT,
+                    timeout_ns as i32,
+                ) {
+                    glow::TIMEOUT_EXPIRED => Ok(false),
+                    glow::WAIT_FAILED => {
+                        if let Err(err) = self.share.check() {
+                            error!("Error when waiting on fence: {:?}", err);
+                        }
+                        Ok(false)
+                    }
+                    glow::CONDITION_SATISFIED | glow::ALREADY_SIGNALED => {
+                        fence.0.set(n::FenceInner::Idle { signaled: true });
+                        Ok(true)
+                    },
+                    _ => unreachable!(),
+                }
+            }
+            n::FenceInner::Pending(None) => {
+                // No sync capability, we fallback to waiting for *everything* to finish
+                gl.flush();
+                fence.0.set(n::FenceInner::Idle { signaled: true });
+                Ok(true)
+            }
         }
     }
 
-    unsafe fn get_fence_status(&self, _: &n::Fence) -> Result<bool, d::DeviceLost> {
+    #[cfg(target_arch = "wasm32")]
+    unsafe fn wait_for_fences<I>(
+        &self,
+        fences: I,
+        wait: d::WaitFor,
+        timeout_ns: u64,
+    ) -> Result<bool, d::OomOrDeviceLost>
+    where
+        I: IntoIterator,
+        I::Item: Borrow<n::Fence>,
+    {
+        let performance = web_sys::window().unwrap().performance().unwrap();
+        let start = performance.now();;
+        let get_elapsed = || {
+            ((performance.now() - start) * 1_000_000.0) as u64
+        };
+
+        match wait {
+            d::WaitFor::All => {
+                for fence in fences {
+                    if !self.wait_for_fence(fence.borrow(), 0)? {
+                        let elapsed_ns = get_elapsed();
+                        if elapsed_ns > timeout_ns {
+                            return Ok(false);
+                        }
+                        if !self.wait_for_fence(fence.borrow(), timeout_ns - elapsed_ns)? {
+                            return Ok(false);
+                        }
+                    }
+                }
+                Ok(true)
+            }
+            d::WaitFor::Any => {
+                const FENCE_WAIT_NS: u64 = 100_000;
+
+                let fences: Vec<_> = fences.into_iter().collect();
+                loop {
+                    for fence in &fences {
+                        if self.wait_for_fence(fence.borrow(), FENCE_WAIT_NS)? {
+                            return Ok(true);
+                        }
+                    }
+                    if get_elapsed() >= timeout_ns {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+    }
+
+    unsafe fn get_fence_status(&self, fence: &n::Fence) -> Result<bool, d::DeviceLost> {
+        Ok(match fence.0.get() {
+            n::FenceInner::Pending(Some(sync)) => {
+                self.share.context.get_sync_status(sync) == glow::SIGNALED
+            }
+            n::FenceInner::Pending(None) => false,
+            n::FenceInner::Idle { signaled } => signaled,
+        })
+    }
+
+    fn create_event(&self) -> Result<(), d::OutOfMemory> {
         unimplemented!()
     }
 
-    unsafe fn free_memory(&self, _memory: n::Memory) {
-        // Nothing to do
+    unsafe fn get_event_status(&self, _event: &()) -> Result<bool, d::OomOrDeviceLost> {
+        unimplemented!()
+    }
+
+    unsafe fn set_event(&self, _event: &()) -> Result<(), d::OutOfMemory> {
+        unimplemented!()
+    }
+
+    unsafe fn reset_event(&self, _event: &()) -> Result<(), d::OutOfMemory> {
+        unimplemented!()
+    }
+
+    unsafe fn free_memory(&self, memory: n::Memory) {
+        if let Some((buffer, _)) = memory.buffer {
+            self.share.context.delete_buffer(buffer);
+        }
     }
 
     unsafe fn create_query_pool(
@@ -1507,21 +1728,24 @@ impl d::Device<B> for Device {
     }
 
     unsafe fn destroy_graphics_pipeline(&self, pipeline: n::GraphicsPipeline) {
-        self.share.context.DeleteProgram(pipeline.program);
+        self.share.context.delete_program(pipeline.program);
     }
 
     unsafe fn destroy_compute_pipeline(&self, pipeline: n::ComputePipeline) {
-        self.share.context.DeleteProgram(pipeline.program);
+        self.share.context.delete_program(pipeline.program);
     }
 
-    unsafe fn destroy_framebuffer(&self, frame_buffer: n::FrameBuffer) {
+    unsafe fn destroy_framebuffer(&self, frame_buffer: Option<n::FrameBuffer>) {
         let gl = &self.share.context;
-        gl.DeleteFramebuffers(1, &frame_buffer);
+        if let Some(f) = frame_buffer {
+            gl.delete_framebuffer(f);
+        }
     }
 
-    unsafe fn destroy_buffer(&self, buffer: n::Buffer) {
-        self.share.context.DeleteBuffers(1, &buffer.raw);
+    unsafe fn destroy_buffer(&self, _buffer: n::Buffer) {
+        // Nothing to do
     }
+
     unsafe fn destroy_buffer_view(&self, _: n::BufferView) {
         // Nothing to do
     }
@@ -1529,8 +1753,8 @@ impl d::Device<B> for Device {
     unsafe fn destroy_image(&self, image: n::Image) {
         let gl = &self.share.context;
         match image.kind {
-            n::ImageKind::Surface(rb) => gl.DeleteRenderbuffers(1, &rb),
-            n::ImageKind::Texture(t) => gl.DeleteTextures(1, &t),
+            n::ImageKind::Surface(rb) => gl.delete_renderbuffer(rb),
+            n::ImageKind::Texture { texture, .. } => gl.delete_texture(texture),
         }
     }
 
@@ -1541,7 +1765,7 @@ impl d::Device<B> for Device {
     unsafe fn destroy_sampler(&self, sampler: n::FatSampler) {
         let gl = &self.share.context;
         match sampler {
-            n::FatSampler::Sampler(s) => gl.DeleteSamplers(1, &s),
+            n::FatSampler::Sampler(s) => gl.delete_sampler(s),
             _ => (),
         }
     }
@@ -1555,10 +1779,11 @@ impl d::Device<B> for Device {
     }
 
     unsafe fn destroy_fence(&self, fence: n::Fence) {
-        let gl = &self.share.context;
-        let sync = fence.0.get();
-        if self.share.private_caps.sync && gl.IsSync(sync) == gl::TRUE {
-            gl.DeleteSync(sync);
+        match fence.0.get() {
+            n::FenceInner::Pending(Some(sync)) => {
+                self.share.context.delete_sync(sync);
+            }
+            _ => {},
         }
     }
 
@@ -1566,12 +1791,16 @@ impl d::Device<B> for Device {
         // Nothing to do
     }
 
+    unsafe fn destroy_event(&self, _event: ()) {
+        unimplemented!()
+    }
+
     unsafe fn create_swapchain(
         &self,
         surface: &mut Surface,
         config: c::SwapchainConfig,
         _old_swapchain: Option<Swapchain>,
-    ) -> Result<(Swapchain, c::Backbuffer<B>), c::window::CreationError> {
+    ) -> Result<(Swapchain, Vec<n::Image>), c::window::CreationError> {
         Ok(self.create_swapchain_impl(surface, config))
     }
 
@@ -1581,25 +1810,8 @@ impl d::Device<B> for Device {
 
     fn wait_idle(&self) -> Result<(), error::HostExecutionError> {
         unsafe {
-            self.share.context.Finish();
+            self.share.context.finish();
         }
         Ok(())
-    }
-}
-
-pub(crate) fn wait_fence(fence: &n::Fence, share: &Starc<Share>, timeout_ns: u64) -> GLenum {
-    // TODO:
-    // This can be called by multiple objects wanting to ensure they have exclusive
-    // access to a resource. How much does this call costs ? The status of the fence
-    // could be cached to avoid calling this more than once (in core or in the backend ?).
-    let gl = &share.context;
-    unsafe {
-        if share.private_caps.sync {
-            gl.ClientWaitSync(fence.0.get(), gl::SYNC_FLUSH_COMMANDS_BIT, timeout_ns)
-        } else {
-            // We fallback to waiting for *everything* to finish
-            gl.Flush();
-            gl::CONDITION_SATISFIED
-        }
     }
 }

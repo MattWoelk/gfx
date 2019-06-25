@@ -1,11 +1,36 @@
-use internal::{Channel, FastStorageMap};
-use native;
-use range_alloc::RangeAllocator;
-use {command, conversions as conv, native as n};
-use {
-    validate_line_width, AsNative, Backend, OnlineRecording, QueueFamily, ResourceIndex, Shared,
+use crate::{
+    command, conversions as conv, native as n,
+    internal::{Channel, FastStorageMap},
+    AsNative, Backend, OnlineRecording, QueueFamily, ResourceIndex, Shared,
     Surface, Swapchain, VisibilityShared,
+    MAX_COLOR_ATTACHMENTS, MAX_BOUND_DESCRIPTOR_SETS,
 };
+
+use hal::{
+    buffer, error, format, image, mapping, memory, pass, pso, query, window,
+    backend::FastHashMap,
+    device::{
+        AllocationError, BindError, DeviceLost, OomOrDeviceLost, OutOfMemory, ShaderError,
+    },
+    memory::Properties,
+    pool::CommandPoolCreateFlags,
+    pso::VertexInputRate,
+    queue::{QueueFamilyId, Queues},
+    range::RangeArg,
+};
+use cocoa::foundation::{NSRange, NSUInteger};
+use copyless::VecHelper;
+use foreign_types::{ForeignType, ForeignTypeRef};
+use metal::{
+    self,
+    CaptureManager, MTLCPUCacheMode, MTLLanguageVersion,
+    MTLPrimitiveTopologyClass, MTLPrimitiveType, MTLResourceOptions, MTLSamplerBorderColor,
+    MTLSamplerMipFilter, MTLStorageMode, MTLTextureType, MTLVertexStepFunction,
+};
+use objc::rc::autoreleasepool;
+use objc::runtime::{Object, BOOL, NO};
+use parking_lot::Mutex;
+use spirv_cross::{msl, spirv, ErrorCode as SpirvErrorCode};
 
 use std::borrow::Borrow;
 use std::cell::RefCell;
@@ -14,28 +39,8 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
-use std::{cmp, iter, mem, ptr, slice, thread, time};
+use std::{cmp, iter, mem, ptr, thread, time};
 
-use hal::device::{
-    AllocationError, BindError, DeviceLost, OomOrDeviceLost, OutOfMemory, ShaderError,
-};
-use hal::memory::Properties;
-use hal::pool::CommandPoolCreateFlags;
-use hal::queue::{QueueFamilyId, Queues};
-use hal::range::RangeArg;
-use hal::{self, buffer, error, format, image, mapping, memory, pass, pso, query, window};
-
-use cocoa::foundation::{NSRange, NSUInteger};
-use foreign_types::ForeignType;
-use metal::{
-    self, CaptureManager, MTLArgumentAccess, MTLCPUCacheMode, MTLDataType, MTLLanguageVersion,
-    MTLPrimitiveTopologyClass, MTLPrimitiveType, MTLResourceOptions, MTLSamplerBorderColor,
-    MTLSamplerMipFilter, MTLStorageMode, MTLTextureType, MTLVertexStepFunction,
-};
-use objc::rc::autoreleasepool;
-use objc::runtime::{Object, BOOL, NO};
-use parking_lot::Mutex;
-use spirv_cross::{msl, spirv, ErrorCode as SpirvErrorCode};
 
 const PUSH_CONSTANTS_DESC_SET: u32 = !0;
 const PUSH_CONSTANTS_DESC_BINDING: u32 = 0;
@@ -60,7 +65,7 @@ enum FunctionError {
 fn get_final_function(
     library: &metal::LibraryRef,
     entry: &str,
-    specialization: pso::Specialization,
+    specialization: &pso::Specialization,
     function_specialization: bool,
 ) -> Result<metal::Function, FunctionError> {
     type MTLFunctionConstant = Object;
@@ -98,7 +103,7 @@ fn get_final_function(
         {
             Some(c) => unsafe {
                 let ptr = &specialization.data[c.range.start as usize] as *const u8 as *const _;
-                let ty: MTLDataType = msg_send![object, type];
+                let ty: metal::MTLDataType = msg_send![object, type];
                 constants.set_constant_value_at_index(c.id as NSUInteger, ty, ptr);
             },
             None if required != NO => {
@@ -132,7 +137,7 @@ impl VisibilityShared {
     }
 }
 
-//#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Device {
     pub(crate) shared: Arc<Shared>,
     memory_types: Vec<hal::MemoryType>,
@@ -176,6 +181,7 @@ impl MemoryTypes {
     }
 }
 
+#[derive(Debug)]
 pub struct PhysicalDevice {
     pub(crate) shared: Arc<Shared>,
     memory_types: Vec<hal::MemoryType>,
@@ -251,6 +257,7 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
         // TODO: Query supported features by feature set rather than hard coding in the supported
         // features. https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf
         if !self.features().contains(requested_features) {
+            warn!("Features missing: {:?}", requested_features - self.features());
             return Err(error::DeviceCreationError::MissingFeature);
         }
 
@@ -329,8 +336,12 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
             // Can't create 2D/2DArray views of 3D textures
             return None;
         }
-        //TODO: actually query this data
-        let max_dimension = 4096u32;
+        let max_dimension = if dimensions == 3 {
+            self.shared.private_caps.max_texture_3d_size as _
+        } else {
+            self.shared.private_caps.max_texture_size as _
+        };
+
         let max_extent = image::Extent {
             width: max_dimension,
             height: if dimensions >= 2 { max_dimension } else { 1 },
@@ -344,7 +355,11 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
                 max_extent,
                 max_levels: if dimensions == 1 { 1 } else { 12 },
                 // 3D images enforce a single layer
-                max_layers: if dimensions == 3 { 1 } else { 2048 },
+                max_layers: if dimensions == 3 {
+                    1
+                } else {
+                    self.shared.private_caps.max_texture_layers as _
+                },
                 sample_count_mask: 0x1,
                 //TODO: buffers and textures have separate limits
                 // Max buffer size is determined by feature set
@@ -380,28 +395,62 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
             }
             | hal::Features::INSTANCE_RATE
             | hal::Features::SEPARATE_STENCIL_REF_VALUES
+            | if self.shared.private_caps.expose_line_mode {
+                hal::Features::NON_FILL_POLYGON_MODE
+            } else {
+                hal::Features::empty()
+            }
+            | hal::Features::SHADER_CLIP_DISTANCE
     }
 
     fn limits(&self) -> hal::Limits {
+        let pc = &self.shared.private_caps;
         hal::Limits {
-            max_texture_size: self.shared.private_caps.max_texture_size as usize,
-            max_texel_elements: (self.shared.private_caps.max_texture_size
-                * self.shared.private_caps.max_texture_size)
-                as usize,
+            max_image_1d_size: pc.max_texture_size as _,
+            max_image_2d_size: pc.max_texture_size as _,
+            max_image_3d_size: pc.max_texture_3d_size as _,
+            max_image_cube_size: pc.max_texture_size as _,
+            max_image_array_layers: pc.max_texture_layers as _,
+            max_texel_elements: (pc.max_texture_size * pc.max_texture_size) as usize,
+            max_uniform_buffer_range: pc.max_buffer_size,
+            max_storage_buffer_range: pc.max_buffer_size,
+            // "Maximum length of an inlined constant data buffer, per graphics or compute function"
+            max_push_constants_size: 0x1000,
+            max_sampler_allocation_count: !0,
+            max_bound_descriptor_sets: MAX_BOUND_DESCRIPTOR_SETS as _,
+            max_descriptor_set_uniform_buffers: 0x100, // also arbitrary, but probably shouldn't be more than max_bound_descriptor_sets
+            max_fragment_input_components: 32, // TODO: Add to private caps since 32 is only for mac
+            max_framebuffer_layers: 2048, // TODO: Determine is this is the correct value
+            max_memory_allocation_count: 4096, // TODO: Determine is this is the correct value
+
+            max_per_stage_descriptor_samplers: pc.max_samplers_per_stage as usize,
+            max_per_stage_descriptor_uniform_buffers: pc.max_buffers_per_stage as usize,
+            max_per_stage_descriptor_storage_buffers: pc.max_buffers_per_stage as usize,
+            max_per_stage_descriptor_sampled_images: pc.max_textures_per_stage as usize,
+            max_per_stage_descriptor_storage_images: pc.max_textures_per_stage as usize,
+            max_per_stage_descriptor_input_attachments: pc.max_textures_per_stage as usize, //TODO
+            max_per_stage_resources: 0x100, //TODO
+
             max_patch_size: 0, // No tessellation
 
             // Note: The maximum number of supported viewports and scissor rectangles varies by device.
             // TODO: read from Metal Feature Sets.
             max_viewports: 1,
+            max_viewport_dimensions: [pc.max_texture_size as _; 2],
+            max_framebuffer_extent: hal::image::Extent { //TODO
+                width: pc.max_texture_size as _,
+                height: pc.max_texture_size as _,
+                depth: pc.max_texture_layers as _,
+            },
 
-            min_buffer_copy_offset_alignment: self.shared.private_caps.buffer_alignment,
-            min_buffer_copy_pitch_alignment: 4,
-            min_texel_buffer_offset_alignment: self.shared.private_caps.buffer_alignment,
-            min_uniform_buffer_offset_alignment: self.shared.private_caps.buffer_alignment,
-            min_storage_buffer_offset_alignment: self.shared.private_caps.buffer_alignment,
+            optimal_buffer_copy_offset_alignment: pc.buffer_alignment,
+            optimal_buffer_copy_pitch_alignment: 4,
+            min_texel_buffer_offset_alignment: pc.buffer_alignment,
+            min_uniform_buffer_offset_alignment: pc.buffer_alignment,
+            min_storage_buffer_offset_alignment: pc.buffer_alignment,
 
-            max_compute_group_count: [16; 3], // TODO
-            max_compute_group_size: [64; 3],  // TODO
+            max_compute_work_group_count: [16; 3], // TODO
+            max_compute_work_group_size: [64; 3],  // TODO
 
             max_vertex_input_attributes: 31,
             max_vertex_input_bindings: 31,
@@ -412,13 +461,16 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
             framebuffer_color_samples_count: 0b101,   // TODO
             framebuffer_depth_samples_count: 0b101,   // TODO
             framebuffer_stencil_samples_count: 0b101, // TODO
-            max_color_attachments: 1,                 // TODO
+            max_color_attachments: MAX_COLOR_ATTACHMENTS,
 
+            buffer_image_granularity: 1,
             // Note: we issue Metal buffer-to-buffer copies on memory flush/invalidate,
             // and those need to operate on sizes being multiples of 4.
             non_coherent_atom_size: 4,
             max_sampler_anisotropy: 16.,
             min_vertex_input_binding_stride_alignment: STRIDE_GRANULARITY as u64,
+
+            .. hal::Limits::default() // TODO!
         }
     }
 }
@@ -500,19 +552,11 @@ impl Device {
 
     fn compile_shader_library(
         device: &Mutex<metal::Device>,
-        raw_data: &[u8],
+        raw_data: &[u32],
         compiler_options: &msl::CompilerOptions,
         msl_version: MTLLanguageVersion,
     ) -> Result<n::ModuleInfo, ShaderError> {
-        // spec requires "codeSize must be a multiple of 4"
-        assert_eq!(raw_data.len() & 3, 0);
-
-        let module = spirv::Module::from_words(unsafe {
-            slice::from_raw_parts(
-                raw_data.as_ptr() as *const u32,
-                raw_data.len() / mem::size_of::<u32>(),
-            )
-        });
+        let module = spirv::Module::from_words(raw_data);
 
         // now parse again using the new overrides
         let mut ast = spirv::Ast::<msl::Target>::parse(&module).map_err(gen_parse_error)?;
@@ -655,7 +699,7 @@ impl Device {
         let mtl_function = get_final_function(
             &lib,
             name,
-            ep.specialization,
+            &ep.specialization,
             self.shared.private_caps.function_specialization,
         )
         .map_err(|e| {
@@ -666,39 +710,76 @@ impl Device {
         Ok((lib, mtl_function, wg_size, info.rasterization_enabled))
     }
 
-    fn describe_argument(
-        ty: pso::DescriptorType,
-        index: pso::DescriptorBinding,
-        count: usize,
-    ) -> metal::ArgumentDescriptor {
-        let arg = metal::ArgumentDescriptor::new().to_owned();
-        arg.set_array_length(count as _);
+    pub fn make_sampler_descriptor(
+        &self,
+        info: image::SamplerInfo,
+    ) -> Result<metal::SamplerDescriptor, AllocationError> {
+        let descriptor = metal::SamplerDescriptor::new();
 
-        match ty {
-            pso::DescriptorType::Sampler => {
-                arg.set_access(MTLArgumentAccess::ReadOnly);
-                arg.set_data_type(MTLDataType::Sampler);
-                arg.set_index(index as _);
+        descriptor.set_min_filter(conv::map_filter(info.min_filter));
+        descriptor.set_mag_filter(conv::map_filter(info.mag_filter));
+        descriptor.set_mip_filter(match info.mip_filter {
+            // Note: this shouldn't be required, but Metal appears to be confused when mipmaps
+            // are provided even with trivial LOD bias.
+            image::Filter::Nearest if info.lod_range.end < image::Lod::from(0.5) => {
+                MTLSamplerMipFilter::NotMipmapped
             }
-            pso::DescriptorType::SampledImage => {
-                arg.set_access(MTLArgumentAccess::ReadOnly);
-                arg.set_data_type(MTLDataType::Texture);
-                arg.set_index(index as _);
-            }
-            pso::DescriptorType::UniformBuffer => {
-                arg.set_access(MTLArgumentAccess::ReadOnly);
-                arg.set_data_type(MTLDataType::Struct);
-                arg.set_index(index as _);
-            }
-            pso::DescriptorType::StorageBuffer => {
-                arg.set_access(MTLArgumentAccess::ReadWrite);
-                arg.set_data_type(MTLDataType::Struct);
-                arg.set_index(index as _);
-            }
-            _ => unimplemented!(),
+            image::Filter::Nearest => MTLSamplerMipFilter::Nearest,
+            image::Filter::Linear => MTLSamplerMipFilter::Linear,
+        });
+
+        if let image::Anisotropic::On(aniso) = info.anisotropic {
+            descriptor.set_max_anisotropy(aniso as _);
         }
 
-        arg
+        let (s, t, r) = info.wrap_mode;
+        descriptor.set_address_mode_s(conv::map_wrap_mode(s));
+        descriptor.set_address_mode_t(conv::map_wrap_mode(t));
+        descriptor.set_address_mode_r(conv::map_wrap_mode(r));
+
+        unsafe {
+            descriptor.set_lod_bias(info.lod_bias.into());
+        }
+        descriptor.set_lod_min_clamp(info.lod_range.start.into());
+        descriptor.set_lod_max_clamp(info.lod_range.end.into());
+
+        let caps = &self.shared.private_caps;
+        // TODO: Clarify minimum macOS version with Apple (43707452)
+        if (caps.os_is_mac && caps.has_version_at_least(10, 13))
+            || (!caps.os_is_mac && caps.has_version_at_least(9, 0))
+        {
+            descriptor.set_lod_average(true); // optimization
+        }
+
+        if let Some(fun) = info.comparison {
+            descriptor.set_compare_function(conv::map_compare_function(fun));
+        }
+        if [r, s, t].iter().any(|&am| am == image::WrapMode::Border) {
+            descriptor.set_border_color(match info.border.0 {
+                0x0000_0000 => MTLSamplerBorderColor::TransparentBlack,
+                0x0000_00FF => MTLSamplerBorderColor::OpaqueBlack,
+                0xFFFF_FFFF => MTLSamplerBorderColor::OpaqueWhite,
+                other => {
+                    error!("Border color 0x{:X} is not supported", other);
+                    MTLSamplerBorderColor::TransparentBlack
+                }
+            });
+        }
+
+        if self.shared.private_caps.argument_buffers {
+            descriptor.set_support_argument_buffers(true);
+        }
+
+        Ok(descriptor)
+    }
+
+    pub fn create_sampler_from_descriptor(
+        &self,
+        descriptor: &metal::SamplerDescriptorRef,
+    ) -> n::Sampler {
+        n::Sampler(
+            self.shared.device.lock().new_sampler(descriptor),
+        )
     }
 }
 
@@ -716,7 +797,7 @@ impl hal::Device<Backend> for Device {
 
     unsafe fn destroy_command_pool(&self, mut pool: command::CommandPool) {
         use hal::pool::RawCommandPool;
-        pool.reset();
+        pool.reset(false);
     }
 
     unsafe fn create_render_pass<'a, IA, IS, ID>(
@@ -841,6 +922,55 @@ impl hal::Device<Backend> for Device {
         let mut res_overrides = BTreeMap::new();
         let mut infos = Vec::new();
 
+        // First, place the push constants
+        let mut pc_buffers = [None; 3];
+        let mut pc_limits = [0u32; 3];
+        for pcr in push_constant_ranges {
+            let (flags, range) = pcr.borrow();
+            for (limit, &(stage_bit, _, _)) in pc_limits.iter_mut().zip(&stage_infos) {
+                if flags.contains(stage_bit) {
+                    *limit = range.end.max(*limit);
+                }
+            }
+        }
+
+        const LIMIT_MASK: u32 = 3;
+        // round up the limits alignment to 4, so that it matches MTL compiler logic
+        //TODO: figure out what and how exactly does the alignment. Clearly, it's not
+        // straightforward, given that value of 2 stays non-aligned.
+        for limit in &mut pc_limits {
+            if *limit > LIMIT_MASK {
+                *limit = (*limit + LIMIT_MASK) & !LIMIT_MASK;
+            }
+        }
+
+        for ((limit, ref mut buffer_index), &mut (_, stage, ref mut counters)) in pc_limits
+            .iter()
+            .zip(pc_buffers.iter_mut())
+            .zip(stage_infos.iter_mut())
+        {
+            // handle the push constant buffer assignment and shader overrides
+            if *limit != 0 {
+                let index = counters.buffers;
+                **buffer_index = Some(index);
+                counters.buffers += 1;
+
+                res_overrides.insert(
+                    msl::ResourceBindingLocation {
+                        stage,
+                        desc_set: PUSH_CONSTANTS_DESC_SET,
+                        binding: PUSH_CONSTANTS_DESC_BINDING,
+                    },
+                    msl::ResourceBinding {
+                        buffer_id: index as _,
+                        texture_id: !0,
+                        sampler_id: !0,
+                    },
+                );
+            }
+        }
+
+        // Second, place the descripted resources
         for (set_index, set_layout) in set_layouts.into_iter().enumerate() {
             // remember where the resources for this set start at each shader stage
             let mut dynamic_buffers = Vec::new();
@@ -856,7 +986,7 @@ impl hal::Device<Backend> for Device {
                             .content
                             .contains(n::DescriptorContent::DYNAMIC_BUFFER)
                         {
-                            dynamic_buffers.push(n::MultiStageData {
+                            dynamic_buffers.alloc().init(n::MultiStageData {
                                 vs: if layout.stages.contains(pso::ShaderStageFlags::VERTEX) {
                                     stage_infos[0].2.buffers
                                 } else {
@@ -904,7 +1034,6 @@ impl hal::Device<Backend> for Device {
                                 } else {
                                     !0
                                 },
-                                force_used: false,
                             };
                             if layout.array_index == 0 {
                                 let location = msl::ResourceBindingLocation {
@@ -917,71 +1046,36 @@ impl hal::Device<Backend> for Device {
                         }
                     }
                 }
-                n::DescriptorSetLayout::ArgumentBuffer(_, stage_flags) => {
-                    for &mut (stage_bit, stage, ref mut counters) in stage_infos.iter_mut() {
-                        if !stage_flags.contains(stage_bit) {
-                            continue;
-                        }
-                        let location = msl::ResourceBindingLocation {
-                            stage,
-                            desc_set: set_index as _,
-                            binding: 0,
-                        };
-                        let res_binding = msl::ResourceBinding {
-                            buffer_id: counters.buffers as _,
-                            texture_id: !0,
-                            sampler_id: !0,
-                            force_used: false,
-                        };
-                        res_overrides.insert(location, res_binding);
+                n::DescriptorSetLayout::ArgumentBuffer { ref bindings, .. } => {
+                    //Note: we specifically ignore the stage flags and unconditionally
+                    // add resource overrides and bump the counter, because there is no
+                    // way to override the argument buffer binding itself in SPIRV-Cross.
+                    //TODO: ^^
+                    for &mut (_stage_bit, stage, ref mut counters) in stage_infos.iter_mut() {
+                        res_overrides.extend(bindings
+                            .iter()
+                            .map(|(&binding, arg)| {
+                                let key = msl::ResourceBindingLocation {
+                                    stage,
+                                    desc_set: set_index as _,
+                                    binding,
+                                };
+                                (key, arg.res.clone())
+                            })
+                        );
                         counters.buffers += 1;
                     }
                 }
             }
 
-            infos.push(n::DescriptorSetInfo {
+            infos.alloc().init(n::DescriptorSetInfo {
                 offsets,
                 dynamic_buffers,
             });
         }
 
-        let mut pc_buffers = [None; 3];
-        let mut pc_limits = [0u32; 3];
-        for pcr in push_constant_ranges {
-            let (flags, range) = pcr.borrow();
-            for (limit, &(stage_bit, _, _)) in pc_limits.iter_mut().zip(&stage_infos) {
-                if flags.contains(stage_bit) {
-                    *limit = range.end.max(*limit);
-                }
-            }
-        }
-
-        for ((limit, ref mut buffer_index), &mut (_, stage, ref mut counters)) in pc_limits
-            .iter()
-            .zip(pc_buffers.iter_mut())
-            .zip(stage_infos.iter_mut())
-        {
-            // handle the push constant buffer assignment and shader overrides
-            if *limit != 0 {
-                let index = counters.buffers;
-                **buffer_index = Some(index);
-                counters.buffers += 1;
-
-                res_overrides.insert(
-                    msl::ResourceBindingLocation {
-                        stage,
-                        desc_set: PUSH_CONSTANTS_DESC_SET,
-                        binding: PUSH_CONSTANTS_DESC_BINDING,
-                    },
-                    msl::ResourceBinding {
-                        buffer_id: index as _,
-                        texture_id: !0,
-                        sampler_id: !0,
-                        force_used: false,
-                    },
-                );
-            }
-            // make sure we fit the limits
+        // Finally, make sure we fit the limits
+        for &(_, _, ref counters) in stage_infos.iter() {
             assert!(counters.buffers <= self.shared.private_caps.max_buffers_per_stage);
             assert!(counters.textures <= self.shared.private_caps.max_textures_per_stage);
             assert!(counters.samplers <= self.shared.private_caps.max_samplers_per_stage);
@@ -998,18 +1092,9 @@ impl hal::Device<Backend> for Device {
         shader_compiler_options.enable_point_size_builtin = false;
         shader_compiler_options.vertex.invert_y = true;
         shader_compiler_options.resource_binding_overrides = res_overrides;
+        shader_compiler_options.enable_argument_buffers = self.shared.private_caps.argument_buffers;
         let mut shader_compiler_options_point = shader_compiler_options.clone();
         shader_compiler_options_point.enable_point_size_builtin = true;
-
-        const LIMIT_MASK: u32 = 3;
-        // round up the limits alignment to 4, so that it matches MTL compiler logic
-        //TODO: figure out what and how exactly does the alignment. Clearly, it's not
-        // straightforward, given that value of 2 stays non-aligned.
-        for limit in &mut pc_limits {
-            if *limit > LIMIT_MASK {
-                *limit = (*limit + LIMIT_MASK) & !LIMIT_MASK;
-            }
-        }
 
         Ok(n::PipelineLayout {
             shader_compiler_options,
@@ -1070,14 +1155,14 @@ impl hal::Device<Backend> for Device {
     {
         let mut dst = target.modules.whole_write();
         for source in sources {
-            let mut src = source.borrow().modules.whole_write();
+            let src = source.borrow().modules.whole_write();
             for (key, value) in src.iter() {
                 let storage = match dst.entry(key.clone()) {
                     Entry::Vacant(e) => e.insert(FastStorageMap::default()),
-                    Entry::Occupied(mut e) => e.into_mut(),
+                    Entry::Occupied(e) => e.into_mut(),
                 };
                 let mut dst_module = storage.whole_write();
-                let mut src_module = value.whole_write();
+                let src_module = value.whole_write();
                 for (key_module, value_module) in src_module.iter() {
                     match dst_module.entry(key_module.clone()) {
                         Entry::Vacant(em) => {
@@ -1100,7 +1185,7 @@ impl hal::Device<Backend> for Device {
         pipeline_desc: &pso::GraphicsPipelineDesc<'a, Backend>,
         cache: Option<&n::PipelineCache>,
     ) -> Result<n::GraphicsPipeline, pso::CreationError> {
-        debug!("create_graphics_pipeline {:?}", pipeline_desc);
+        debug!("create_graphics_pipeline {:#?}", pipeline_desc);
         let pipeline = metal::RenderPipelineDescriptor::new();
         let pipeline_layout = &pipeline_desc.layout;
         let (rp_attachments, subpass) = {
@@ -1202,11 +1287,7 @@ impl hal::Device<Backend> for Device {
             desc.set_pixel_format(mtl_format);
             desc.set_write_mask(conv::map_write_mask(mask));
 
-            if let pso::BlendState::On {
-                ref color,
-                ref alpha,
-            } = *blend
-            {
+            if let pso::BlendState::On { color, alpha } = *blend {
                 desc.set_blending_enabled(true);
                 let (color_op, color_src, color_dst) = conv::map_blend_op(color);
                 let (alpha_op, alpha_src, alpha_dst) = conv::map_blend_op(alpha);
@@ -1233,7 +1314,6 @@ impl hal::Device<Backend> for Device {
         }
 
         // Vertex buffers
-        let attribute_buffer_index = pipeline_layout.attribute_buffer_index();
         let vertex_descriptor = metal::VertexDescriptor::new();
         let mut vertex_buffers: n::VertexBufferVec = Vec::new();
         trace!("Vertex attribute remapping started");
@@ -1266,11 +1346,11 @@ impl hal::Device<Backend> for Device {
                 .iter()
                 .position(|(ref vb, offset)| vb.binding == binding && base_offset == *offset)
                 .unwrap_or_else(|| {
-                    vertex_buffers.push((original.clone(), base_offset));
+                    vertex_buffers.alloc().init((original.clone(), base_offset));
                     vertex_buffers.len() - 1
                 });
-            let mtl_buffer_index = attribute_buffer_index as usize + relative_index;
-            if mtl_buffer_index >= self.shared.private_caps.max_buffers_per_stage as usize {
+            let mtl_buffer_index = self.shared.private_caps.max_buffers_per_stage - 1 - (relative_index as ResourceIndex);
+            if mtl_buffer_index < pipeline_layout.total.vs.buffers {
                 error!("Attribute offset {} exceeds the stride {}, and there is no room for replacement.",
                     element.offset, original.stride);
                 return Err(pso::CreationError::Other);
@@ -1292,7 +1372,7 @@ impl hal::Device<Backend> for Device {
         for (i, (vb, _)) in vertex_buffers.iter().enumerate() {
             let mtl_buffer_desc = vertex_descriptor
                 .layouts()
-                .object_at(attribute_buffer_index as usize + i)
+                .object_at(self.shared.private_caps.max_buffers_per_stage as usize - 1 - i)
                 .expect("too many vertex descriptor layouts");
             if vb.stride % STRIDE_GRANULARITY != 0 {
                 error!(
@@ -1303,11 +1383,14 @@ impl hal::Device<Backend> for Device {
             }
             if vb.stride != 0 {
                 mtl_buffer_desc.set_stride(vb.stride as u64);
-                if vb.rate == 0 {
-                    mtl_buffer_desc.set_step_function(MTLVertexStepFunction::PerVertex);
-                } else {
-                    mtl_buffer_desc.set_step_function(MTLVertexStepFunction::PerInstance);
-                    mtl_buffer_desc.set_step_rate(vb.rate as u64);
+                match vb.rate {
+                    VertexInputRate::Vertex => {
+                        mtl_buffer_desc.set_step_function(MTLVertexStepFunction::PerVertex);
+                    }
+                    VertexInputRate::Instance(divisor) => {
+                        mtl_buffer_desc.set_step_function(MTLVertexStepFunction::PerInstance);
+                        mtl_buffer_desc.set_step_rate(divisor as u64);
+                    }
                 }
             } else {
                 mtl_buffer_desc.set_stride(256); // big enough to fit all the elements
@@ -1319,12 +1402,9 @@ impl hal::Device<Backend> for Device {
             pipeline.set_vertex_descriptor(Some(&vertex_descriptor));
         }
 
-        if let pso::PolygonMode::Line(width) = pipeline_desc.rasterizer.polygon_mode {
-            validate_line_width(width);
-        }
-
         let rasterizer_state = Some(n::RasterizerState {
             front_winding: conv::map_winding(pipeline_desc.rasterizer.front_face),
+            fill_mode: conv::map_polygon_mode(pipeline_desc.rasterizer.polygon_mode),
             cull_mode: match conv::map_cull_face(pipeline_desc.rasterizer.cull_face) {
                 Some(mode) => mode,
                 None => {
@@ -1357,6 +1437,14 @@ impl hal::Device<Backend> for Device {
             .depth_stencil_states
             .prepare(&pipeline_desc.depth_stencil, &*device);
 
+        if let Some(multisampling) = &pipeline_desc.multisampling {
+            pipeline.set_sample_count(multisampling.rasterization_samples as u64);
+            pipeline.set_alpha_to_coverage_enabled(multisampling.alpha_coverage);
+            pipeline.set_alpha_to_one_enabled(multisampling.alpha_to_one);
+            // TODO: sample_mask
+            // TODO: sample_shading
+        }
+
         device
             .new_render_pipeline_state(&pipeline)
             .map(|raw| n::GraphicsPipeline {
@@ -1364,7 +1452,6 @@ impl hal::Device<Backend> for Device {
                 fs_lib,
                 raw,
                 primitive_type,
-                attribute_buffer_index,
                 vs_pc_info: pipeline_desc.layout.push_constants.vs,
                 ps_pc_info: pipeline_desc.layout.push_constants.ps,
                 rasterizer_state,
@@ -1431,7 +1518,7 @@ impl hal::Device<Backend> for Device {
         })
     }
 
-    unsafe fn create_shader_module(&self, raw_data: &[u8]) -> Result<n::ShaderModule, ShaderError> {
+    unsafe fn create_shader_module(&self, raw_data: &[u32]) -> Result<n::ShaderModule, ShaderError> {
         //TODO: we can probably at least parse here and save the `Ast`
         let depends_on_pipeline_layout = true; //TODO: !self.private_caps.argument_buffers
         Ok(if depends_on_pipeline_layout {
@@ -1454,59 +1541,8 @@ impl hal::Device<Backend> for Device {
         &self,
         info: image::SamplerInfo,
     ) -> Result<n::Sampler, AllocationError> {
-        let descriptor = metal::SamplerDescriptor::new();
-
-        descriptor.set_min_filter(conv::map_filter(info.min_filter));
-        descriptor.set_mag_filter(conv::map_filter(info.mag_filter));
-        descriptor.set_mip_filter(match info.mip_filter {
-            // Note: this shouldn't be required, but Metal appears to be confused when mipmaps
-            // are provided even with trivial LOD bias.
-            image::Filter::Nearest if info.lod_range.end < image::Lod::from(0.5) => {
-                MTLSamplerMipFilter::NotMipmapped
-            }
-            image::Filter::Nearest => MTLSamplerMipFilter::Nearest,
-            image::Filter::Linear => MTLSamplerMipFilter::Linear,
-        });
-
-        if let image::Anisotropic::On(aniso) = info.anisotropic {
-            descriptor.set_max_anisotropy(aniso as _);
-        }
-
-        let (s, t, r) = info.wrap_mode;
-        descriptor.set_address_mode_s(conv::map_wrap_mode(s));
-        descriptor.set_address_mode_t(conv::map_wrap_mode(t));
-        descriptor.set_address_mode_r(conv::map_wrap_mode(r));
-
-        descriptor.set_lod_bias(info.lod_bias.into());
-        descriptor.set_lod_min_clamp(info.lod_range.start.into());
-        descriptor.set_lod_max_clamp(info.lod_range.end.into());
-
-        let caps = &self.shared.private_caps;
-        // TODO: Clarify minimum macOS version with Apple (43707452)
-        if (caps.os_is_mac && caps.has_version_at_least(10, 13))
-            || (!caps.os_is_mac && caps.has_version_at_least(9, 0))
-        {
-            descriptor.set_lod_average(true); // optimization
-        }
-
-        if let Some(fun) = info.comparison {
-            descriptor.set_compare_function(conv::map_compare_function(fun));
-        }
-        if [r, s, t].iter().any(|&am| am == image::WrapMode::Border) {
-            descriptor.set_border_color(match info.border.0 {
-                0x00000000 => MTLSamplerBorderColor::TransparentBlack,
-                0x000000FF => MTLSamplerBorderColor::OpaqueBlack,
-                0xFFFFFFFF => MTLSamplerBorderColor::OpaqueWhite,
-                other => {
-                    error!("Border color 0x{:X} is not supported", other);
-                    MTLSamplerBorderColor::TransparentBlack
-                }
-            });
-        }
-
-        Ok(n::Sampler(
-            self.shared.device.lock().new_sampler(&descriptor),
-        ))
+        let descriptor = self.make_sampler_descriptor(info)?;
+        Ok(self.create_sampler_from_descriptor(&descriptor))
     }
 
     unsafe fn destroy_sampler(&self, _sampler: n::Sampler) {}
@@ -1621,45 +1657,42 @@ impl hal::Device<Backend> for Device {
 
     unsafe fn create_descriptor_pool<I>(
         &self,
-        _max_sets: usize,
+        max_sets: usize,
         descriptor_ranges: I,
+        _flags: pso::DescriptorPoolCreateFlags,
     ) -> Result<n::DescriptorPool, OutOfMemory>
     where
         I: IntoIterator,
         I::Item: Borrow<pso::DescriptorRangeDesc>,
     {
-        let mut counters = n::ResourceData::<n::PoolResourceIndex>::new();
-
         if self.shared.private_caps.argument_buffers {
-            let mut arguments = Vec::new();
+            let mut arguments = n::ArgumentArray::default();
             for desc_range in descriptor_ranges {
-                let desc = desc_range.borrow();
-                let offset_ref = match desc.ty {
-                    pso::DescriptorType::Sampler => &mut counters.samplers,
-                    pso::DescriptorType::SampledImage => &mut counters.textures,
-                    pso::DescriptorType::UniformBuffer | pso::DescriptorType::StorageBuffer => {
-                        &mut counters.buffers
-                    }
-                    _ => unimplemented!(),
-                };
-                let index = *offset_ref;
-                *offset_ref += desc.count as n::PoolResourceIndex;
-                let arg_desc = Self::describe_argument(desc.ty, index as _, desc.count);
-                arguments.push(arg_desc);
+                let dr = desc_range.borrow();
+                let content = n::DescriptorContent::from(dr.ty);
+                let usage = n::ArgumentArray::describe_usage(dr.ty);
+                if content.contains(n::DescriptorContent::BUFFER) {
+                    arguments.push(metal::MTLDataType::Pointer, dr.count, usage);
+                }
+                if content.contains(n::DescriptorContent::TEXTURE) {
+                    arguments.push(metal::MTLDataType::Texture, dr.count, usage);
+                }
+                if content.contains(n::DescriptorContent::SAMPLER) {
+                    arguments.push(metal::MTLDataType::Sampler, dr.count, usage);
+                }
             }
 
             let device = self.shared.device.lock();
-            let arg_array = metal::Array::from_owned_slice(&arguments);
-            let encoder = device.new_argument_encoder(&arg_array);
+            let (array_ref, total_resources) = arguments.build();
+            let encoder = device.new_argument_encoder(array_ref);
 
-            let total_size = encoder.encoded_length();
+            let alignment = self.shared.private_caps.buffer_alignment;
+            let total_size = encoder.encoded_length() + (max_sets as u64) * alignment;
             let raw = device.new_buffer(total_size, MTLResourceOptions::empty());
 
-            Ok(n::DescriptorPool::ArgumentBuffer {
-                raw,
-                range_allocator: RangeAllocator::new(0..total_size),
-            })
+            Ok(n::DescriptorPool::new_argument(raw, total_size, alignment, total_resources))
         } else {
+            let mut counters = n::ResourceData::<n::PoolResourceIndex>::new();
             for desc_range in descriptor_ranges {
                 let dr = desc_range.borrow();
                 counters.add_many(
@@ -1684,18 +1717,54 @@ impl hal::Device<Backend> for Device {
     {
         if self.shared.private_caps.argument_buffers {
             let mut stage_flags = pso::ShaderStageFlags::empty();
-            let arguments = binding_iter
-                .into_iter()
-                .map(|desc| {
-                    let desc = desc.borrow();
-                    stage_flags |= desc.stage_flags;
-                    Self::describe_argument(desc.ty, desc.binding, desc.count)
-                })
-                .collect::<Vec<_>>();
-            let arg_array = metal::Array::from_owned_slice(&arguments);
-            let encoder = self.shared.device.lock().new_argument_encoder(&arg_array);
+            let mut arguments = n::ArgumentArray::default();
+            let mut bindings = FastHashMap::default();
+            for desc in binding_iter {
+                let desc = desc.borrow();
+                stage_flags |= desc.stage_flags;
+                let content = n::DescriptorContent::from(desc.ty);
+                let usage = n::ArgumentArray::describe_usage(desc.ty);
+                let res = msl::ResourceBinding {
+                    buffer_id: if content.contains(n::DescriptorContent::BUFFER)
+                    {
+                        arguments.push(metal::MTLDataType::Pointer, desc.count, usage) as u32
+                    } else {
+                        !0
+                    },
+                    texture_id: if content.contains(n::DescriptorContent::TEXTURE)
+                    {
+                        arguments.push(metal::MTLDataType::Texture, desc.count, usage) as u32
+                    } else {
+                        !0
+                    },
+                    sampler_id: if content.contains(n::DescriptorContent::SAMPLER)
+                    {
+                        arguments.push(metal::MTLDataType::Sampler, desc.count, usage) as u32
+                    } else {
+                        !0
+                    },
+                };
+                let res_offset = res.buffer_id.min(res.texture_id).min(res.sampler_id);
+                bindings.insert(desc.binding, n::ArgumentLayout {
+                    res,
+                    res_offset,
+                    count: desc.count,
+                    usage,
+                    content,
+                });
+            };
 
-            Ok(n::DescriptorSetLayout::ArgumentBuffer(encoder, stage_flags))
+            let (array_ref, arg_total) = arguments.build();
+            let encoder = self.shared.device
+                .lock()
+                .new_argument_encoder(array_ref);
+
+            Ok(n::DescriptorSetLayout::ArgumentBuffer {
+                encoder,
+                stage_flags,
+                bindings: Arc::new(bindings),
+                total: arg_total as n::PoolResourceIndex,
+            })
         } else {
             struct TempSampler {
                 sampler: metal::SamplerState,
@@ -1708,9 +1777,9 @@ impl hal::Device<Backend> for Device {
 
             for set_layout_binding in binding_iter {
                 let slb = set_layout_binding.borrow();
-                let mut content = native::DescriptorContent::from(slb.ty);
+                let mut content = n::DescriptorContent::from(slb.ty);
                 if slb.immutable_samplers {
-                    content |= native::DescriptorContent::IMMUTABLE_SAMPLER;
+                    content |= n::DescriptorContent::IMMUTABLE_SAMPLER;
                     tmp_samplers.extend(
                         immutable_sampler_iter
                             .by_ref()
@@ -1723,7 +1792,7 @@ impl hal::Device<Backend> for Device {
                             }),
                     );
                 }
-                desc_layouts.extend((0..slb.count).map(|array_index| native::DescriptorLayout {
+                desc_layouts.extend((0..slb.count).map(|array_index| n::DescriptorLayout {
                     content,
                     stages: slb.stage_flags,
                     binding: slb.binding,
@@ -1829,35 +1898,68 @@ impl hal::Device<Backend> for Device {
                 }
                 n::DescriptorSet::ArgumentBuffer {
                     ref raw,
-                    offset,
+                    raw_offset,
+                    ref pool,
+                    ref range,
                     ref encoder,
+                    ref bindings,
                     ..
                 } => {
                     debug_assert!(self.shared.private_caps.argument_buffers);
 
-                    encoder.set_argument_buffer(raw, offset);
-                    //TODO: range checks, need to keep some layout metadata around
-                    assert_eq!(write.array_offset, 0); //TODO
+                    encoder.set_argument_buffer(raw, raw_offset);
+                    let mut arg_index = {
+                        let binding = &bindings[&write.binding];
+                        debug_assert!((write.array_offset as usize) < binding.count);
+                        (binding.res_offset as NSUInteger) + (write.array_offset as NSUInteger)
+                    };
 
-                    for descriptor in write.descriptors {
+                    for (data, descriptor) in pool
+                        .write()
+                        .resources[range.start as usize + arg_index as usize .. range.end as usize]
+                        .iter_mut()
+                        .zip(write.descriptors)
+                    {
                         match *descriptor.borrow() {
                             pso::Descriptor::Sampler(sampler) => {
-                                encoder.set_sampler_states(&[&sampler.0], write.binding as _);
+                                encoder.set_sampler_state(&sampler.0, arg_index);
+                                arg_index += 1;
                             }
                             pso::Descriptor::Image(image, _layout) => {
-                                encoder.set_textures(&[&image.raw], write.binding as _);
+                                encoder.set_texture(&image.raw, arg_index);
+                                data.ptr = (&**image.raw).as_ptr();
+                                arg_index += 1;
+                            }
+                            pso::Descriptor::CombinedImageSampler(image, _il, sampler) => {
+                                let binding = &bindings[&write.binding];
+                                if !binding.content
+                                    .contains(n::DescriptorContent::IMMUTABLE_SAMPLER)
+                                {
+                                    //TODO: supporting arrays of combined image-samplers can be tricky.
+                                    // We need to scan both sampler and image sections of the encoder
+                                    // at the same time.
+                                    assert!(arg_index < (binding.res_offset as NSUInteger) + (binding.count as NSUInteger));
+                                    encoder.set_sampler_state(&sampler.0, arg_index + binding.count as NSUInteger);
+                                }
+                                encoder.set_texture(&image.raw, arg_index);
+                                data.ptr = (&**image.raw).as_ptr();
+                            }
+                            pso::Descriptor::UniformTexelBuffer(view) |
+                            pso::Descriptor::StorageTexelBuffer(view) => {
+                                encoder.set_texture(&view.raw, arg_index);
+                                data.ptr = (&**view.raw).as_ptr();
+                                arg_index += 1;
                             }
                             pso::Descriptor::Buffer(buffer, ref desc_range) => {
-                                let (raw, range) = buffer.as_bound();
+                                let (buf_raw, buf_range) = buffer.as_bound();
                                 encoder.set_buffer(
-                                    raw,
-                                    range.start + desc_range.start.unwrap_or(0),
-                                    write.binding as _,
+                                    buf_raw,
+                                    buf_range.start + desc_range.start.unwrap_or(0),
+                                    arg_index,
                                 );
+                                data.ptr = (&**buf_raw).as_ptr();
+                                arg_index += 1;
                             }
-                            pso::Descriptor::CombinedImageSampler(..)
-                            | pso::Descriptor::UniformTexelBuffer(..)
-                            | pso::Descriptor::StorageTexelBuffer(..) => unimplemented!(),
                         }
                     }
                 }
@@ -2136,7 +2238,7 @@ impl hal::Device<Backend> for Device {
             .shared
             .private_caps
             .map_format(format)
-            .ok_or(image::CreationError::Format(format))?;
+            .ok_or_else(|| image::CreationError::Format(format))?;
 
         let descriptor = metal::TextureDescriptor::new();
 
@@ -2379,7 +2481,14 @@ impl hal::Device<Backend> for Device {
             levels: 0..raw.mipmap_level_count() as image::Level,
             layers: 0..image.kind.num_layers(),
         };
-        let mtl_type = conv::map_texture_type(kind);
+        let mtl_type = if image.mtl_type == MTLTextureType::D2Multisample {
+            if kind != image::ViewKind::D2 {
+                error!("Requested {:?} for MSAA texture", kind);
+            }
+            image.mtl_type
+        } else {
+            conv::map_texture_type(kind)
+        };
 
         let view = if mtl_format == image.mtl_format
             && mtl_type == image.mtl_type
@@ -2413,10 +2522,13 @@ impl hal::Device<Backend> for Device {
     unsafe fn destroy_image_view(&self, _view: n::ImageView) {}
 
     fn create_fence(&self, signaled: bool) -> Result<n::Fence, OutOfMemory> {
-        Ok(n::Fence(RefCell::new(n::FenceInner::Idle { signaled })))
+        let cell = RefCell::new(n::FenceInner::Idle { signaled });
+        debug!("Creating fence ptr {:?} with signal={}", cell.as_ptr(), signaled);
+        Ok(n::Fence(cell))
     }
     unsafe fn reset_fence(&self, fence: &n::Fence) -> Result<(), OutOfMemory> {
-        *fence.0.borrow_mut() = n::FenceInner::Idle { signaled: false };
+        debug!("Resetting fence ptr {:?}", fence.0.as_ptr());
+        fence.0.replace(n::FenceInner::Idle { signaled: false });
         Ok(())
     }
     unsafe fn wait_for_fence(
@@ -2429,37 +2541,74 @@ impl hal::Device<Backend> for Device {
         }
 
         debug!("wait_for_fence {:?} for {} ms", fence, timeout_ns);
-        let inner = fence.0.borrow();
-        let cmd_buf = match *inner {
-            native::FenceInner::Idle { signaled } => return Ok(signaled),
-            native::FenceInner::Pending(ref cmd_buf) => cmd_buf,
-        };
-        if timeout_ns == !0 {
-            cmd_buf.wait_until_completed();
-            return Ok(true);
-        }
-
-        let start = time::Instant::now();
-        loop {
-            if let metal::MTLCommandBufferStatus::Completed = cmd_buf.status() {
-                return Ok(true);
+        match *fence.0.borrow() {
+            n::FenceInner::Idle { signaled } => {
+                if !signaled {
+                    warn!("Fence ptr {:?} is not pending, waiting not possible", fence.0.as_ptr());
+                }
+                Ok(signaled)
             }
-            if to_ns(start.elapsed()) >= timeout_ns {
-                return Ok(false);
+            n::FenceInner::PendingSubmission(ref cmd_buf) => {
+                if timeout_ns == !0 {
+                    cmd_buf.wait_until_completed();
+                    return Ok(true);
+                }
+                let start = time::Instant::now();
+                loop {
+                    if let metal::MTLCommandBufferStatus::Completed = cmd_buf.status() {
+                        return Ok(true);
+                    }
+                    if to_ns(start.elapsed()) >= timeout_ns {
+                        return Ok(false);
+                    }
+                    thread::sleep(time::Duration::from_millis(1));
+                }
             }
-            thread::sleep(time::Duration::from_millis(1));
+            n::FenceInner::AcquireFrame { ref swapchain_image, iteration } => {
+                if swapchain_image.iteration() > iteration {
+                    Ok(true)
+                } else if timeout_ns == 0 {
+                    Ok(false)
+                } else {
+                    swapchain_image.wait_until_ready();
+                    Ok(true)
+                }
+            }
         }
     }
     unsafe fn get_fence_status(&self, fence: &n::Fence) -> Result<bool, DeviceLost> {
         Ok(match *fence.0.borrow() {
-            native::FenceInner::Idle { signaled } => signaled,
-            native::FenceInner::Pending(ref cmd_buf) => match cmd_buf.status() {
+            n::FenceInner::Idle { signaled } => signaled,
+            n::FenceInner::PendingSubmission(ref cmd_buf) => match cmd_buf.status() {
                 metal::MTLCommandBufferStatus::Completed => true,
                 _ => false,
             },
+            n::FenceInner::AcquireFrame { ref swapchain_image, iteration } => {
+                swapchain_image.iteration() > iteration
+            }
         })
     }
     unsafe fn destroy_fence(&self, _fence: n::Fence) {}
+
+    fn create_event(&self) -> Result<(), OutOfMemory> {
+        unimplemented!()
+    }
+
+    unsafe fn get_event_status(&self, _event: &()) -> Result<bool, OomOrDeviceLost> {
+        unimplemented!()
+    }
+
+    unsafe fn set_event(&self, _event: &()) -> Result<(), OutOfMemory> {
+        unimplemented!()
+    }
+
+    unsafe fn reset_event(&self, _event: &()) -> Result<(), OutOfMemory> {
+        unimplemented!()
+    }
+
+    unsafe fn destroy_event(&self, _event: ()) {
+        unimplemented!()
+    }
 
     unsafe fn create_query_pool(
         &self,
@@ -2504,7 +2653,7 @@ impl hal::Device<Backend> for Device {
         flags: query::ResultFlags,
     ) -> Result<bool, OomOrDeviceLost> {
         let is_ready = match *pool {
-            native::QueryPool::Occlusion(ref pool_range) => {
+            n::QueryPool::Occlusion(ref pool_range) => {
                 let visibility = &self.shared.visibility;
                 let is_ready = if flags.contains(query::ResultFlags::WAIT) {
                     let mut guard = visibility.allocator.lock();
@@ -2565,7 +2714,7 @@ impl hal::Device<Backend> for Device {
         surface: &mut Surface,
         config: hal::SwapchainConfig,
         old_swapchain: Option<Swapchain>,
-    ) -> Result<(Swapchain, hal::Backbuffer<Backend>), window::CreationError> {
+    ) -> Result<(Swapchain, Vec<n::Image>), window::CreationError> {
         Ok(self.build_swapchain(surface, config, old_swapchain))
     }
 

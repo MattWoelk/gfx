@@ -1,7 +1,7 @@
 //! Functionality only required for backend implementations.
 
-use queue::{QueueFamily, Queues};
-use Backend;
+use crate::queue::{QueueFamily, Queues};
+use crate::Backend;
 
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
@@ -11,6 +11,7 @@ use fxhash::FxHasher;
 /// Bare-metal queue group.
 ///
 /// Denotes all queues created from one queue family.
+#[derive(Debug)]
 pub struct RawQueueGroup<B: Backend> {
     pub family: B::QueueFamily,
     pub queues: Vec<B::CommandQueue>,

@@ -1,6 +1,6 @@
 [package]
 name = "gfx-backend-dx12"
-version = "0.1.0"
+version = "0.2.0"
 description = "DirectX-12 API backend for gfx-rs"
 homepage = "https://github.com/gfx-rs/gfx"
 repository = "https://github.com/gfx-rs/gfx"
@@ -18,13 +18,13 @@ default = ["winit"]
 name = "gfx_backend_dx12"
 
 [dependencies]
-gfx-hal = { path = "../../hal", version = "0.1" }
+gfx-hal = { path = "../../hal", version = "0.2" }
 range-alloc = { path = "../../auxil/range-alloc", version = "0.1" }
 bitflags = "1"
 derivative = "1"
 d3d12 = "0.1"
 log = { version = "0.4" }
 smallvec = "0.6"
-spirv_cross = "0.12.1"
-winapi = { version = "0.3", features = ["basetsd","d3d12","d3d12sdklayers","d3d12shader","d3dcommon","d3dcompiler","dxgi1_2","dxgi1_3","dxgi1_4","dxgiformat","dxgitype","handleapi","minwindef","synchapi","unknwnbase","winbase","windef","winerror","winnt","winuser"] }
-winit = { version = "0.18", optional = true }
+spirv_cross = { version = "0.14.0", features = ["hlsl"] }
+winapi = { version = "0.3", features = ["basetsd","d3d12","d3d12sdklayers","d3d12shader","d3dcommon","d3dcompiler","dxgi1_2","dxgi1_3","dxgi1_4","dxgi1_6","dxgidebug","dxgiformat","dxgitype","handleapi","minwindef","synchapi","unknwnbase","winbase","windef","winerror","winnt","winuser"] }
+winit = { version = "0.19", optional = true }

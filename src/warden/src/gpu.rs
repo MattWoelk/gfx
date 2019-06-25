@@ -8,10 +8,10 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::{iter, slice};
 
-use hal::{self, buffer as b, command as c, format as f, image as i, memory, pso};
-use hal::{DescriptorPool, Device, PhysicalDevice};
+use crate::hal::{self, buffer as b, command as c, format as f, image as i, memory, pso};
+use crate::hal::{DescriptorPool, Device, PhysicalDevice};
 
-use raw;
+use crate::raw;
 
 const COLOR_RANGE: i::SubresourceRange = i::SubresourceRange {
     aspects: f::Aspects::COLOR,
@@ -244,7 +244,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                         access
                     } else {
                         // calculate required sizes
-                        let upload_size = align(size as _, limits.min_buffer_copy_pitch_alignment);
+                        let upload_size = align(size as _, limits.optimal_buffer_copy_pitch_alignment);
                         // create upload buffer
                         let mut upload_buffer =
                             unsafe { device.create_buffer(upload_size, b::Usage::TRANSFER_SRC) }
@@ -400,7 +400,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                         let d = extent.depth;
 
                         let width_bytes = (format_desc.bits as u64 * w) / (8 * block_width as u64);
-                        let row_pitch = align(width_bytes, limits.min_buffer_copy_pitch_alignment);
+                        let row_pitch = align(width_bytes, limits.optimal_buffer_copy_pitch_alignment);
                         let upload_size =
                             (row_pitch as u64 * h as u64 * d as u64) / block_height as u64;
                         // create upload buffer
@@ -567,7 +567,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                     }
                     let full_path = data_path.join(local_path);
                     let base_file = File::open(&full_path).unwrap();
-                    let mut file = match &*full_path.extension().unwrap().to_string_lossy() {
+                    let file = match &*full_path.extension().unwrap().to_string_lossy() {
                         "spirv" => base_file,
                         #[cfg(feature = "glsl-to-spirv")]
                         "vert" => transpile(base_file, glsl_to_spirv::ShaderType::Vertex),
@@ -577,8 +577,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                         "comp" => transpile(base_file, glsl_to_spirv::ShaderType::Compute),
                         other => panic!("Unknown shader extension: {}", other),
                     };
-                    let mut spirv = Vec::new();
-                    file.read_to_end(&mut spirv).unwrap();
+                    let spirv = hal::read_spirv(file).unwrap();
                     let module = unsafe { device.create_shader_module(&spirv) }.unwrap();
                     resources.shaders.insert(name.clone(), module);
                 }
@@ -602,8 +601,14 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                 } => {
                     assert!(!ranges.is_empty());
                     assert!(capacity > 0);
-                    let pool = unsafe { device.create_descriptor_pool(capacity, ranges) }
-                        .expect("Descriptor pool creation failure!");
+                    let pool = unsafe {
+                        device.create_descriptor_pool(
+                            capacity,
+                            ranges,
+                            pso::DescriptorPoolCreateFlags::empty(),
+                        )
+                    }
+                    .expect("Descriptor pool creation failure!");
                     resources.desc_pools.insert(name.clone(), pool);
                 }
                 _ => {}
@@ -805,7 +810,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
         // fill up command buffers
         let mut jobs = HashMap::new();
         for (name, job) in &raw.jobs {
-            use raw::TransferCommand as Tc;
+            use crate::raw::TransferCommand as Tc;
             let mut command_buf = command_pool.acquire_command_buffer::<c::MultiShot>();
             unsafe {
                 command_buf.begin(false);
@@ -1113,7 +1118,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
                             encoder = encoder.next_subpass_inline();
                         }
                         for command in &pass.1[subpass].commands {
-                            use raw::DrawCommand as Dc;
+                            use crate::raw::DrawCommand as Dc;
                             match *command {
                                 Dc::BindIndexBuffer {
                                     ref buffer,
@@ -1262,7 +1267,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
 
         let command_buffers = iter::once(&self.init_submit).chain(submits);
         unsafe {
-            self.queue_group.queues[0].submit_nosemaphores(command_buffers, None);
+            self.queue_group.queues[0].submit_without_semaphores(command_buffers, None);
         }
     }
 
@@ -1274,7 +1279,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
             .expect(&format!("Unable to find buffer to fetch: {}", name));
         let limits = &self.limits;
 
-        let down_size = align(buffer.size as u64, limits.min_buffer_copy_pitch_alignment);
+        let down_size = align(buffer.size as u64, limits.optimal_buffer_copy_pitch_alignment);
 
         let mut down_buffer =
             unsafe { self.device.create_buffer(down_size, b::Usage::TRANSFER_DST) }.unwrap();
@@ -1337,7 +1342,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
             .expect("Can't create copy-fence");
         unsafe {
             self.queue_group.queues[0]
-                .submit_nosemaphores(iter::once(&cmd_buffer), Some(&copy_fence));
+                .submit_without_semaphores(iter::once(&cmd_buffer), Some(&copy_fence));
             self.device.wait_for_fence(&copy_fence, !0).unwrap();
             self.device.destroy_fence(copy_fence);
             self.device.destroy_command_pool(command_pool.into_raw());
@@ -1380,7 +1385,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
         let height = align(height as _, block_height as _);
 
         let width_bytes = (format_desc.bits as u64 * width as u64) / (8 * block_width as u64);
-        let row_pitch = align(width_bytes, limits.min_buffer_copy_pitch_alignment);
+        let row_pitch = align(width_bytes, limits.optimal_buffer_copy_pitch_alignment);
         let down_size = (row_pitch * height * depth as u64) / block_height as u64;
 
         let mut down_buffer =
@@ -1465,7 +1470,7 @@ impl<B: hal::Backend> Scene<B, hal::General> {
             .expect("Can't create copy-fence");
         unsafe {
             self.queue_group.queues[0]
-                .submit_nosemaphores(iter::once(&cmd_buffer), Some(&copy_fence));
+                .submit_without_semaphores(iter::once(&cmd_buffer), Some(&copy_fence));
             self.device.wait_for_fence(&copy_fence, !0).unwrap();
             self.device.destroy_fence(copy_fence);
             self.device.destroy_command_pool(command_pool.into_raw());

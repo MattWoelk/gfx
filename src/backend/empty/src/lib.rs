@@ -5,9 +5,9 @@ extern crate gfx_hal as hal;
 #[cfg(feature = "winit")]
 extern crate winit;
 
-use hal::range::RangeArg;
-use hal::{
-    buffer, command, device, error, format, image, mapping, memory, pass, pool, pso, query, queue,
+use crate::hal::range::RangeArg;
+use crate::hal::{
+    buffer, command, device, error, format, image, mapping, memory, pass, pool, pso, query, queue, window,
 };
 use std::borrow::Borrow;
 use std::ops::Range;
@@ -49,10 +49,12 @@ impl hal::Backend for Backend {
 
     type Fence = ();
     type Semaphore = ();
+    type Event = ();
     type QueryPool = ();
 }
 
 /// Dummy physical device.
+#[derive(Debug)]
 pub struct PhysicalDevice;
 impl hal::PhysicalDevice<Backend> for PhysicalDevice {
     unsafe fn open(
@@ -92,6 +94,7 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
 }
 
 /// Dummy command queue doing nothing.
+#[derive(Debug)]
 pub struct RawCommandQueue;
 impl queue::RawCommandQueue<Backend> for RawCommandQueue {
     unsafe fn submit<'a, T, Ic, S, Iw, Is>(
@@ -108,7 +111,7 @@ impl queue::RawCommandQueue<Backend> for RawCommandQueue {
         unimplemented!()
     }
 
-    unsafe fn present<'a, W, Is, S, Iw>(&mut self, _: Is, _: Iw) -> Result<(), ()>
+    unsafe fn present<'a, W, Is, S, Iw>(&mut self, _: Is, _: Iw) -> Result<Option<window::Suboptimal>, window::PresentError>
     where
         W: 'a + Borrow<Swapchain>,
         Is: IntoIterator<Item = (&'a W, hal::SwapImageIndex)>,
@@ -124,6 +127,7 @@ impl queue::RawCommandQueue<Backend> for RawCommandQueue {
 }
 
 /// Dummy device doing nothing.
+#[derive(Debug)]
 pub struct Device;
 impl hal::Device<Backend> for Device {
     unsafe fn create_command_pool(
@@ -209,7 +213,7 @@ impl hal::Device<Backend> for Device {
         unimplemented!()
     }
 
-    unsafe fn create_shader_module(&self, _: &[u8]) -> Result<(), device::ShaderError> {
+    unsafe fn create_shader_module(&self, _: &[u32]) -> Result<(), device::ShaderError> {
         unimplemented!()
     }
 
@@ -290,6 +294,7 @@ impl hal::Device<Backend> for Device {
         &self,
         _: usize,
         _: I,
+        _: pso::DescriptorPoolCreateFlags,
     ) -> Result<DescriptorPool, device::OutOfMemory>
     where
         I: IntoIterator,
@@ -338,6 +343,22 @@ impl hal::Device<Backend> for Device {
     }
 
     unsafe fn get_fence_status(&self, _: &()) -> Result<bool, device::DeviceLost> {
+        unimplemented!()
+    }
+
+    fn create_event(&self) -> Result<(), device::OutOfMemory> {
+        unimplemented!()
+    }
+
+    unsafe fn get_event_status(&self, _: &()) -> Result<bool, device::OomOrDeviceLost> {
+        unimplemented!()
+    }
+
+    unsafe fn set_event(&self, _: &()) -> Result<(), device::OutOfMemory> {
+        unimplemented!()
+    }
+
+    unsafe fn reset_event(&self, _: &()) -> Result<(), device::OutOfMemory> {
         unimplemented!()
     }
 
@@ -446,12 +467,16 @@ impl hal::Device<Backend> for Device {
         unimplemented!()
     }
 
+    unsafe fn destroy_event(&self, _: ()) {
+        unimplemented!()
+    }
+
     unsafe fn create_swapchain(
         &self,
         _: &mut Surface,
         _: hal::SwapchainConfig,
         _: Option<Swapchain>,
-    ) -> Result<(Swapchain, hal::Backbuffer<Backend>), hal::window::CreationError> {
+    ) -> Result<(Swapchain, Vec<()>), hal::window::CreationError> {
         unimplemented!()
     }
 
@@ -479,9 +504,10 @@ impl queue::QueueFamily for QueueFamily {
 }
 
 /// Dummy raw command pool.
+#[derive(Debug)]
 pub struct RawCommandPool;
 impl pool::RawCommandPool<Backend> for RawCommandPool {
-    unsafe fn reset(&mut self) {
+    unsafe fn reset(&mut self, _: bool) {
         unimplemented!()
     }
 
@@ -494,6 +520,7 @@ impl pool::RawCommandPool<Backend> for RawCommandPool {
 }
 
 /// Dummy command buffer, which ignores all the calls.
+#[derive(Debug)]
 pub struct RawCommandBuffer;
 impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
     unsafe fn begin(
@@ -755,6 +782,28 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         unimplemented!()
     }
 
+    unsafe fn set_event(&mut self, _: &(), _: pso::PipelineStage) {
+        unimplemented!()
+    }
+
+    unsafe fn reset_event(&mut self, _: &(), _: pso::PipelineStage) {
+        unimplemented!()
+    }
+
+    unsafe fn wait_events<'a, I, J>(
+        &mut self,
+        _: I,
+        _: Range<pso::PipelineStage>,
+        _: J
+    ) where
+        I: IntoIterator,
+        I::Item: Borrow<()>,
+        J: IntoIterator,
+        J::Item: Borrow<memory::Barrier<'a, Backend>>,
+    {
+        unimplemented!()
+    }
+
     unsafe fn begin_query(&mut self, _: query::Query<Backend>, _: query::ControlFlags) {
         unimplemented!()
     }
@@ -823,6 +872,7 @@ impl pso::DescriptorPool<Backend> for DescriptorPool {
 }
 
 /// Dummy surface.
+#[derive(Debug)]
 pub struct Surface;
 impl hal::Surface<Backend> for Surface {
     fn kind(&self) -> hal::image::Kind {
@@ -846,13 +896,15 @@ impl hal::Surface<Backend> for Surface {
 }
 
 /// Dummy swapchain.
+#[derive(Debug)]
 pub struct Swapchain;
 impl hal::Swapchain<Backend> for Swapchain {
     unsafe fn acquire_image(
         &mut self,
         _: u64,
-        _: hal::FrameSync<Backend>,
-    ) -> Result<hal::SwapImageIndex, hal::AcquireError> {
+        _: Option<&()>,
+        _: Option<&()>,
+    ) -> Result<(hal::SwapImageIndex, Option<hal::window::Suboptimal>), hal::AcquireError> {
         unimplemented!()
     }
 }

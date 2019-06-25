@@ -14,17 +14,18 @@
 use std::any::Any;
 use std::borrow::Borrow;
 use std::ops::Range;
-use std::{iter, mem, slice};
+use std::{fmt, iter, mem, slice};
 
-use {buffer, format, image, mapping, pass, pso, query};
-use {Backend, MemoryTypeId};
+use crate::{buffer, format, image, mapping, pass, pso, query};
+use crate::{Backend, MemoryTypeId};
 
-use error::HostExecutionError;
-use memory::Requirements;
-use pool::{CommandPool, CommandPoolCreateFlags};
-use queue::{QueueFamilyId, QueueGroup};
-use range::RangeArg;
-use window::{self, Backbuffer, SwapchainConfig};
+use crate::error::HostExecutionError;
+use crate::memory::Requirements;
+use crate::pool::{CommandPool, CommandPoolCreateFlags};
+use crate::pso::DescriptorPoolCreateFlags;
+use crate::queue::{QueueFamilyId, QueueGroup};
+use crate::range::RangeArg;
+use crate::window::{self, SwapchainConfig};
 
 /// Error occurred caused device to be lost.
 #[derive(Clone, Copy, Debug, Fail, PartialEq, Eq)]
@@ -171,7 +172,7 @@ impl From<OutOfMemory> for ShaderError {
 /// are not enforced at the HAL level due to OpenGL constraint (to be revised). Users can still
 /// benefit from the backends that support synchronization of the `Device`.
 ///
-pub trait Device<B: Backend>: Any + Send + Sync {
+pub trait Device<B: Backend>: fmt::Debug + Any + Send + Sync {
     /// Allocates a memory segment of a specified type.
     ///
     /// There is only a limited amount of allocations allowed depending on the implementation!
@@ -265,10 +266,16 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     unsafe fn destroy_pipeline_layout(&self, layout: B::PipelineLayout);
 
     /// Create a pipeline cache object.
-    unsafe fn create_pipeline_cache(&self, data: Option<&[u8]>) -> Result<B::PipelineCache, OutOfMemory>;
+    unsafe fn create_pipeline_cache(
+        &self,
+        data: Option<&[u8]>,
+    ) -> Result<B::PipelineCache, OutOfMemory>;
 
     /// Retrieve data from pipeline cache object.
-    unsafe fn get_pipeline_cache_data(&self, cache: &B::PipelineCache) -> Result<Vec<u8>, OutOfMemory>;
+    unsafe fn get_pipeline_cache_data(
+        &self,
+        cache: &B::PipelineCache,
+    ) -> Result<Vec<u8>, OutOfMemory>;
 
     /// Merge a number of source pipeline caches into the target one.
     unsafe fn merge_pipeline_caches<I>(
@@ -347,7 +354,10 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     /// which references the compute pipeline, has finished execution.
     unsafe fn destroy_compute_pipeline(&self, pipeline: B::ComputePipeline);
 
-    /// Create a new framebuffer object
+    /// Create a new framebuffer object.
+    ///
+    /// # Safety
+    /// - `extent.width`, `extent.height` and `extent.depth` **must** be greater than `0`.
     unsafe fn create_framebuffer<I>(
         &self,
         pass: &B::RenderPass,
@@ -370,7 +380,7 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     /// shader stages as described in *Compute Pipelines* and *Graphics Pipelines*.
     unsafe fn create_shader_module(
         &self,
-        spirv_data: &[u8],
+        spirv_data: &[u32],
     ) -> Result<B::ShaderModule, ShaderError>;
 
     /// Destroy a shader module module
@@ -483,6 +493,7 @@ pub trait Device<B: Backend>: Any + Send + Sync {
         &self,
         max_sets: usize,
         descriptor_ranges: I,
+        flags: DescriptorPoolCreateFlags,
     ) -> Result<B::DescriptorPool, OutOfMemory>
     where
         I: IntoIterator,
@@ -718,6 +729,23 @@ pub trait Device<B: Backend>: Any + Send + Sync {
     /// Destroy a fence object
     unsafe fn destroy_fence(&self, fence: B::Fence);
 
+    /// Create an event object.
+    fn create_event(&self) -> Result<B::Event, OutOfMemory>;
+
+    /// Destroy an event object.
+    unsafe fn destroy_event(&self, event: B::Event);
+
+    /// Query the status of an event.
+    ///
+    /// Returns `true` if the event is set, or `false` if it is reset.
+    unsafe fn get_event_status(&self, event: &B::Event) -> Result<bool, OomOrDeviceLost>;
+
+    /// Sets an event.
+    unsafe fn set_event(&self, event: &B::Event) -> Result<(), OutOfMemory>;
+
+    /// Resets an event.
+    unsafe fn reset_event(&self, event: &B::Event) -> Result<(), OutOfMemory>;
+
     /// Create a new query pool object
     ///
     /// Queries are managed using query pool objects. Each query pool is a collection of a specific
@@ -776,7 +804,7 @@ pub trait Device<B: Backend>: Any + Send + Sync {
         surface: &mut B::Surface,
         config: SwapchainConfig,
         old_swapchain: Option<B::Swapchain>,
-    ) -> Result<(B::Swapchain, Backbuffer<B>), window::CreationError>;
+    ) -> Result<(B::Swapchain, Vec<B::Image>), window::CreationError>;
 
     ///
     unsafe fn destroy_swapchain(&self, swapchain: B::Swapchain);

@@ -7,11 +7,13 @@ use super::{
     AttachmentClear, BufferCopy, BufferImageCopy, ImageBlit, ImageCopy, ImageResolve,
     SubpassContents,
 };
-use image::{Filter, Layout, SubresourceRange};
-use memory::{Barrier, Dependencies};
-use range::RangeArg;
-use {buffer, pass, pso, query};
-use {Backend, DrawCount, IndexCount, InstanceCount, VertexCount, VertexOffset, WorkGroupCount};
+use crate::image::{Filter, Layout, SubresourceRange};
+use crate::memory::{Barrier, Dependencies};
+use crate::range::RangeArg;
+use crate::{buffer, pass, pso, query};
+use crate::{
+    Backend, DrawCount, IndexCount, InstanceCount, VertexCount, VertexOffset, WorkGroupCount,
+};
 
 /// Unsafe variant of `ClearColor`.
 #[repr(C)]
@@ -24,6 +26,12 @@ pub union ClearColorRaw {
     /// `u32` variant
     pub uint32: [u32; 4],
     _align: [u32; 4],
+}
+
+impl std::fmt::Debug for ClearColorRaw {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        writeln![f, "ClearColorRaw"]
+    }
 }
 
 /// A variant of `ClearDepthStencil` that has a `#[repr(C)]` layout
@@ -117,7 +125,7 @@ impl<'a, B: Backend> Default for CommandBufferInheritanceInfo<'a, B> {
 
 /// A trait that describes all the operations that must be
 /// provided by a `Backend`'s command buffer.
-pub trait RawCommandBuffer<B: Backend>: Any + Send + Sync {
+pub trait RawCommandBuffer<B: Backend>: fmt::Debug + Any + Send + Sync {
     /// Begins recording commands to a command buffer.
     unsafe fn begin(
         &mut self,
@@ -209,8 +217,19 @@ pub trait RawCommandBuffer<B: Backend>: Any + Send + Sync {
     /// will operate on.
     ///
     /// Each buffer passed corresponds to the vertex input binding with the same index,
-    /// starting from an offset index `first_binding`.
-    unsafe fn bind_vertex_buffers<I, T>(&mut self, first_binding: u32, buffers: I)
+    /// starting from an offset index `first_binding`. For example an iterator with
+    /// two items and `first_binding` of 1 would fill vertex buffer binding numbers
+    /// 1 and 2.
+    ///
+    /// This binding number refers only to binding points for vertex buffers and is
+    /// completely separate from the binding numbers of `Descriptor`s in `DescriptorSet`s.
+    /// It needs to match with the `VertexBufferDesc` and `AttributeDesc`s to which the
+    /// data from each bound vertex buffer should flow.
+    ///
+    /// The `buffers` iterator should yield the `Buffer` to bind, as well as an
+    /// offset, in bytes, into that buffer where the vertex data that should be bound
+    /// starts.
+    unsafe fn bind_vertex_buffers<I, T>(&mut self, first_binding: pso::BufferIndex, buffers: I)
     where
         I: IntoIterator<Item = (T, buffer::Offset)>,
         T: Borrow<B::Buffer>;
@@ -370,7 +389,7 @@ pub trait RawCommandBuffer<B: Backend>: Any + Send + Sync {
     /// - A compute pipeline must be bound using `bind_compute_pipeline`.
     /// - Only queues with compute capability support this function.
     /// - This function must be called outside of a render pass.
-    /// - `count` must be less than or equal to `Limits::max_compute_group_count`
+    /// - `count` must be less than or equal to `Limits::max_compute_work_group_count`
     ///
     /// TODO:
     unsafe fn dispatch(&mut self, count: WorkGroupCount);
@@ -473,6 +492,29 @@ pub trait RawCommandBuffer<B: Backend>: Any + Send + Sync {
         draw_count: DrawCount,
         stride: u32,
     );
+
+    /// Signals an event once all specified stages of the shader pipeline have completed.
+    unsafe fn set_event(&mut self, event: &B::Event, stages: pso::PipelineStage);
+
+    /// Resets an event once all specified stages of the shader pipeline have completed.
+    unsafe fn reset_event(&mut self, event: &B::Event, stages: pso::PipelineStage);
+
+    /// Waits at some shader stage(s) until all events have been signalled.
+    ///
+    /// - `src_stages` specifies the shader pipeline stages in which the events were signalled.
+    /// - `dst_stages` specifies the shader pipeline stages at which execution should wait.
+    /// - `barriers` specifies a series of memory barriers to be executed before pipeline execution
+    ///   resumes.
+    unsafe fn wait_events<'a, I, J>(
+        &mut self,
+        events: I,
+        stages: Range<pso::PipelineStage>,
+        barriers: J,
+    ) where
+        I: IntoIterator,
+        I::Item: Borrow<B::Event>,
+        J: IntoIterator,
+        J::Item: Borrow<Barrier<'a, B>>;
 
     /// Begins a query operation.  Queries count operations or record timestamps
     /// resulting from commands that occur between the beginning and end of the query,

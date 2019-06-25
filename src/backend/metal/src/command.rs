@@ -1,38 +1,46 @@
-use internal::{BlitVertex, ClearKey, ClearVertex};
-use {conversions as conv, native, soft, window};
-use {
-    validate_line_width, AsNative, Backend, BufferPtr, OnlineRecording, PrivateDisabilities,
-    ResourceIndex, SamplerPtr, Shared, TexturePtr,
+use crate::{
+    MAX_BOUND_DESCRIPTOR_SETS,
+    conversions as conv, native, soft, window,
+    internal::{BlitVertex, ClearKey, ClearVertex},
+    AsNative, Backend, BufferPtr, OnlineRecording, PrivateDisabilities,
+    ResourceIndex, ResourcePtr, SamplerPtr, Shared, TexturePtr,
 };
 
-use std::borrow::Borrow;
-use std::cell::RefCell;
-use std::ops::{Deref, Range};
-use std::sync::Arc;
-use std::{cmp, iter, mem, slice, time};
-
-use hal::backend::FastHashMap;
-use hal::format::{Aspects, FormatDesc};
-use hal::image::{Extent, Filter, Layout, Level, SubresourceRange};
-use hal::pass::AttachmentLoadOp;
-use hal::queue::{RawCommandQueue, Submission};
-use hal::range::RangeArg;
-use hal::{buffer, command as com, error, memory, pool, pso, query};
 use hal::{
+    self,
+    buffer, command as com, error, memory, pool, pso, query,
+    backend::FastHashMap,
+    format::{Aspects, FormatDesc},
+    image::{Extent, Filter, Layout, Level, SubresourceRange},
+    pass::AttachmentLoadOp,
+    queue::{RawCommandQueue, Submission},
+    range::RangeArg,
     DrawCount, IndexCount, IndexType, InstanceCount, SwapImageIndex, VertexCount, VertexOffset,
-    WorkGroupCount,
+    WorkGroupCount, window::{PresentError, Suboptimal},
 };
 
+use arrayvec::ArrayVec;
 use block::ConcreteBlock;
 use cocoa::foundation::{NSRange, NSUInteger};
+use copyless::VecHelper;
 use foreign_types::ForeignType;
-use metal::{self, MTLIndexType, MTLPrimitiveType, MTLScissorRect, MTLSize, MTLViewport};
+use metal::{
+    self,
+    MTLIndexType, MTLPrimitiveType, MTLScissorRect, MTLSize, MTLViewport,
+};
 use objc::rc::autoreleasepool;
 use parking_lot::Mutex;
-use smallvec::SmallVec;
-
 #[cfg(feature = "dispatch")]
 use dispatch;
+
+use std::{
+    iter, mem, ptr, slice, time,
+    borrow::Borrow,
+    cell::RefCell,
+    ops::{Deref, Range},
+    sync::Arc,
+};
+
 
 const WORD_SIZE: usize = 4;
 const WORD_ALIGNMENT: u64 = WORD_SIZE as _;
@@ -43,6 +51,7 @@ const CLEAR_IMAGE_ARRAY: bool = false && cfg!(target_os = "macos");
 /// Number of frames to average when reporting the performance counters.
 const COUNTERS_REPORT_WINDOW: usize = 0;
 
+#[derive(Debug)]
 pub struct QueueInner {
     raw: metal::CommandQueue,
     reserve: Range<usize>,
@@ -112,6 +121,7 @@ impl QueueInner {
     }
 }
 
+#[derive(Debug)]
 struct PoolShared {
     online_recording: OnlineRecording,
     #[cfg(feature = "dispatch")]
@@ -121,6 +131,7 @@ struct PoolShared {
 type CommandBufferInnerPtr = Arc<RefCell<CommandBufferInner>>;
 type PoolSharedPtr = Arc<RefCell<PoolShared>>;
 
+#[derive(Debug)]
 pub struct CommandPool {
     shared: Arc<Shared>,
     allocated: Vec<CommandBufferInnerPtr>,
@@ -150,6 +161,7 @@ impl CommandPool {
     }
 }
 
+#[derive(Debug)]
 pub struct CommandBuffer {
     shared: Arc<Shared>,
     pool_shared: PoolSharedPtr,
@@ -161,6 +173,7 @@ pub struct CommandBuffer {
 unsafe impl Send for CommandBuffer {}
 unsafe impl Sync for CommandBuffer {}
 
+#[derive(Debug)]
 struct Temp {
     clear_vertices: Vec<ClearVertex>,
     blit_vertices: FastHashMap<(Aspects, Level), Vec<BlitVertex>>,
@@ -169,30 +182,48 @@ struct Temp {
 
 type VertexBufferMaybeVec = Vec<Option<(pso::VertexBufferDesc, pso::ElemOffset)>>;
 
+#[derive(Debug)]
 struct RenderPipelineState {
     raw: metal::RenderPipelineState,
     ds_desc: pso::DepthStencilDesc,
     vertex_buffers: VertexBufferMaybeVec,
-    attribute_buffer_index: ResourceIndex,
     formats: native::SubpassFormats,
 }
 
+#[derive(Debug)]
 struct SubpassInfo {
     descriptor: metal::RenderPassDescriptor,
     combined_aspects: Aspects,
     formats: native::SubpassFormats,
 }
 
+#[derive(Debug, Default)]
+struct DescriptorSetInfo {
+    graphics_resources: Vec<(ResourcePtr, metal::MTLResourceUsage)>,
+    compute_resources: Vec<(ResourcePtr, metal::MTLResourceUsage)>,
+}
+
 /// The current state of a command buffer, used for two distinct purposes:
 ///   1. inherit resource bindings between passes
 ///   2. avoid redundant state settings
+///
+/// ## Spaces
 /// Note that these two usages are distinct and operate in technically different
 /// spaces (1 - Vulkan, 2 - Metal), so be careful not to confuse them.
+/// For example, Vulkan spaces are `pending_subpasses`, `rasterizer_state`, `target_*`.
+/// While Metal spaces are `resources_*`.
+///
+/// ## Vertex buffers
+/// You may notice that vertex buffers are stored in two separate places: per pipeline, and
+/// here in the state. These can't be merged together easily because at binding time we
+/// want one input vertex buffer to potentially be bound to multiple entry points....
+#[derive(Debug)]
 struct State {
     // Note: this could be `MTLViewport` but we have to patch the depth separately.
     viewport: Option<(pso::Rect, Range<f32>)>,
     scissors: Option<MTLScissorRect>,
     blend_color: Option<pso::ColorValue>,
+    //TODO: move some of that state out, to avoid redundant allocations
     render_pso: Option<RenderPipelineState>,
     /// A flag to handle edge cases of Vulkan binding inheritance:
     /// we don't want to consider the current PSO bound for a new pass if it's not compatible.
@@ -200,6 +231,7 @@ struct State {
     compute_pso: Option<metal::ComputePipelineState>,
     work_group_size: MTLSize,
     primitive_type: MTLPrimitiveType,
+    //TODO: move Metal-side state into a separate struct
     resources_vs: StageResources,
     resources_ps: StageResources,
     resources_cs: StageResources,
@@ -209,14 +241,17 @@ struct State {
     stencil: native::StencilState<pso::StencilValue>,
     push_constants: Vec<u32>,
     vertex_buffers: Vec<Option<(BufferPtr, u64)>>,
+    ///TODO: add a structure to store render target state
     target_aspects: Aspects,
     target_extent: Extent,
     target_formats: native::SubpassFormats,
     visibility_query: (metal::MTLVisibilityResultMode, buffer::Offset),
     pending_subpasses: Vec<SubpassInfo>,
+    descriptor_sets: ArrayVec<[DescriptorSetInfo; MAX_BOUND_DESCRIPTOR_SETS]>,
 }
 
 impl State {
+    /// Resets the current Metal side of the state tracking.
     fn reset_resources(&mut self) {
         self.resources_vs.clear();
         self.resources_ps.clear();
@@ -224,6 +259,10 @@ impl State {
         self.push_constants.clear();
         self.vertex_buffers.clear();
         self.pending_subpasses.clear();
+        for ds in self.descriptor_sets.iter_mut() {
+            ds.graphics_resources.clear();
+            ds.compute_resources.clear();
+        }
     }
 
     fn clamp_scissor(sr: MTLScissorRect, extent: Extent) -> MTLScissorRect {
@@ -239,11 +278,11 @@ impl State {
         }
     }
 
-    fn make_pso_commands<'a>(
-        &'a self,
+    fn make_pso_commands(
+        &self,
     ) -> (
-        Option<soft::RenderCommand<&'a soft::Ref>>,
-        Option<soft::RenderCommand<&'a soft::Ref>>,
+        Option<soft::RenderCommand<&soft::Ref>>,
+        Option<soft::RenderCommand<&soft::Ref>>,
     ) {
         if self.render_pso_is_compatible {
             (
@@ -260,10 +299,10 @@ impl State {
         }
     }
 
-    fn make_render_commands<'a>(
-        &'a self,
+    fn make_render_commands(
+        &self,
         aspects: Aspects,
-    ) -> impl Iterator<Item = soft::RenderCommand<&'a soft::Ref>> {
+    ) -> impl Iterator<Item = soft::RenderCommand<&soft::Ref>> {
         // Apply previously bound values for this command buffer
         let com_vp = self
             .viewport
@@ -327,6 +366,16 @@ impl State {
                     .chain(iter::once(com_samplers))
                     .chain(com_push_constants)
             });
+        let com_used_resources = self.descriptor_sets
+            .iter()
+            .flat_map(|ds| {
+                ds.graphics_resources
+                    .iter()
+                    .map(|&(resource, usage)| soft::RenderCommand::UseResource {
+                        resource,
+                        usage,
+                    })
+            });
 
         com_vp
             .into_iter()
@@ -338,11 +387,10 @@ impl State {
             .chain(com_rast)
             //.chain(com_ds) // done outside
             .chain(com_resources)
+            .chain(com_used_resources)
     }
 
-    fn make_compute_commands<'a>(
-        &'a self,
-    ) -> impl Iterator<Item = soft::ComputeCommand<&'a soft::Ref>> {
+    fn make_compute_commands(&self) -> impl Iterator<Item = soft::ComputeCommand<&soft::Ref>> {
         let resources = &self.resources_cs;
         let com_pso = self
             .compute_pso
@@ -367,6 +415,17 @@ impl State {
                     index: pc.buffer_index as _,
                     words: &self.push_constants[..pc.count as usize],
                 });
+        let com_used_resources = self.descriptor_sets
+            .iter()
+            .flat_map(|ds| {
+                ds.compute_resources
+                    .iter()
+                    .map(|&(resource, usage)| soft::ComputeCommand::UseResource {
+                        resource,
+                        usage,
+                    })
+            });
+
 
         com_pso
             .into_iter()
@@ -374,17 +433,20 @@ impl State {
             .chain(iter::once(com_textures))
             .chain(iter::once(com_samplers))
             .chain(com_push_constants)
+            .chain(com_used_resources)
     }
 
-    fn set_vertex_buffers(&mut self) -> Option<soft::RenderCommand<&soft::Ref>> {
+    fn set_vertex_buffers(
+        &mut self, end: usize
+    ) -> Option<soft::RenderCommand<&soft::Ref>> {
         let rps = self.render_pso.as_ref()?;
-        let start = rps.attribute_buffer_index as usize;
-        let end = start + rps.vertex_buffers.len();
+        let start = end - rps.vertex_buffers.len();
         self.resources_vs.pre_allocate_buffers(end);
 
-        for ((out_buffer, out_offset), vb_maybe) in self.resources_vs.buffers[start..]
+        for ((out_buffer, out_offset), vb_maybe) in self.resources_vs.buffers[..end]
             .iter_mut()
-            .zip(self.resources_vs.buffer_offsets[start..].iter_mut())
+            .rev()
+            .zip(self.resources_vs.buffer_offsets[..end].iter_mut().rev())
             .zip(&rps.vertex_buffers)
         {
             match vb_maybe {
@@ -409,7 +471,7 @@ impl State {
 
         Some(soft::RenderCommand::BindBuffers {
             stage: pso::Stage::Vertex,
-            index: rps.attribute_buffer_index,
+            index: start as ResourceIndex,
             buffers: (
                 &self.resources_vs.buffers[start..end],
                 &self.resources_vs.buffer_offsets[start..end],
@@ -419,7 +481,7 @@ impl State {
 
     fn build_depth_stencil(&self) -> Option<pso::DepthStencilDesc> {
         let mut desc = match self.render_pso {
-            Some(ref ps) => ps.ds_desc.clone(),
+            Some(ref ps) => ps.ds_desc,
             None => return None,
         };
 
@@ -462,10 +524,10 @@ impl State {
         soft::RenderCommand::SetDepthBias(*depth_bias)
     }
 
-    fn push_vs_constants<'a>(
-        &'a mut self,
+    fn push_vs_constants(
+        &mut self,
         pc: native::PushConstantInfo,
-    ) -> soft::RenderCommand<&'a soft::Ref> {
+    ) -> soft::RenderCommand<&soft::Ref> {
         self.resources_vs.push_constants = Some(pc);
         soft::RenderCommand::BindBufferData {
             stage: pso::Stage::Vertex,
@@ -474,10 +536,10 @@ impl State {
         }
     }
 
-    fn push_ps_constants<'a>(
-        &'a mut self,
+    fn push_ps_constants(
+        &mut self,
         pc: native::PushConstantInfo,
-    ) -> soft::RenderCommand<&'a soft::Ref> {
+    ) -> soft::RenderCommand<&soft::Ref> {
         self.resources_ps.push_constants = Some(pc);
         soft::RenderCommand::BindBufferData {
             stage: pso::Stage::Fragment,
@@ -486,10 +548,10 @@ impl State {
         }
     }
 
-    fn push_cs_constants<'a>(
-        &'a mut self,
+    fn push_cs_constants(
+        &mut self,
         pc: native::PushConstantInfo,
-    ) -> soft::ComputeCommand<&'a soft::Ref> {
+    ) -> soft::ComputeCommand<&soft::Ref> {
         self.resources_cs.push_constants = Some(pc);
         soft::ComputeCommand::BindBufferData {
             index: pc.buffer_index,
@@ -500,7 +562,7 @@ impl State {
     fn set_viewport<'a>(
         &mut self,
         vp: &'a pso::Viewport,
-        disabilities: &PrivateDisabilities,
+        disabilities: PrivateDisabilities,
     ) -> soft::RenderCommand<&'a soft::Ref> {
         let depth = vp.depth.start..if disabilities.broken_viewport_near_depth {
             (vp.depth.end - vp.depth.start)
@@ -511,7 +573,7 @@ impl State {
         soft::RenderCommand::SetViewport(vp.rect, depth)
     }
 
-    fn set_scissor<'a>(&mut self, rect: &'a pso::Rect) -> soft::RenderCommand<&'a soft::Ref> {
+    fn set_scissor<'a>(&mut self, rect: pso::Rect) -> soft::RenderCommand<&'a soft::Ref> {
         let scissor = MTLScissorRect {
             x: rect.x as _,
             y: rect.y as _,
@@ -599,7 +661,7 @@ impl StageResources {
     fn bind_set(
         &mut self,
         stage: pso::ShaderStageFlags,
-        data: &native::DescriptorPoolInner,
+        data: &native::DescriptorEmulatedPoolInner,
         mut res_offset: native::ResourceData<ResourceIndex>,
         layouts: &[native::DescriptorLayout],
         pool_range: &native::ResourceData<Range<native::PoolResourceIndex>>,
@@ -667,7 +729,7 @@ unsafe impl Send for SharedCommandBuffer {}
 impl EncodePass {
     fn schedule(self, queue: &dispatch::Queue, cmd_buffer_arc: &Arc<Mutex<metal::CommandBuffer>>) {
         let cmd_buffer = SharedCommandBuffer(Arc::clone(cmd_buffer_arc));
-        queue.async(move || match self {
+        queue.r#async(move || match self {
             EncodePass::Render(list, desc) => {
                 let encoder = cmd_buffer
                     .0
@@ -773,8 +835,9 @@ impl Journal {
                 (soft::Pass::Render(_), ref mut range) => {
                     range.end += other.render_commands.len();
                 }
-                (soft::Pass::Compute, _) |
-                (soft::Pass::Blit, _) => panic!("Only render passes can inherit"),
+                (soft::Pass::Compute, _) | (soft::Pass::Blit, _) => {
+                    panic!("Only render passes can inherit")
+                }
             }
         } else {
             for (ref pass, ref range) in &other.passes {
@@ -783,9 +846,9 @@ impl Journal {
                     soft::Pass::Compute => self.compute_commands.len(),
                     soft::Pass::Blit => self.blit_commands.len(),
                 };
-                self.passes.push((
+                self.passes.alloc().init((
                     pass.clone(),
-                    range.start + offset .. range.end + offset,
+                    range.start + offset..range.end + offset,
                 ));
             }
         }
@@ -795,7 +858,7 @@ impl Journal {
         // Each upper level points to the lower one with index
         // sub-ranges. In order to merge two journals, we need
         // to fix those indices of the one that goes on top.
-        // This is referred here as "rebasing". 
+        // This is referred here as "rebasing".
         for mut com in other.render_commands.iter().cloned() {
             self.resources.rebase_render(&mut com);
             self.render_commands.push(com);
@@ -810,6 +873,7 @@ impl Journal {
     }
 }
 
+#[derive(Debug)]
 enum CommandSink {
     Immediate {
         cmd_buffer: metal::CommandBuffer,
@@ -851,11 +915,11 @@ impl<'a> PreRender<'a> {
         }
     }
 
-    fn issue<'b>(&mut self, command: soft::RenderCommand<&'b soft::Ref>) {
+    fn issue(&mut self, command: soft::RenderCommand<&soft::Ref>) {
         match *self {
             PreRender::Immediate(encoder) => exec_render(encoder, command, &&soft::Ref),
             PreRender::Deferred(ref mut resources, ref mut list) => {
-                list.push(resources.own_render(command))
+                list.alloc().init(resources.own_render(command));
             }
             PreRender::Void => (),
         }
@@ -895,7 +959,7 @@ impl<'a> PreCompute<'a> {
         match *self {
             PreCompute::Immediate(encoder) => exec_compute(encoder, command, &&soft::Ref),
             PreCompute::Deferred(ref mut resources, ref mut list) => {
-                list.push(resources.own_compute(command))
+                list.alloc().init(resources.own_compute(command));
             }
             PreCompute::Void => (),
         }
@@ -1003,9 +1067,10 @@ impl CommandSink {
             } => {
                 assert!(!is_inheriting);
                 *is_encoding = true;
-                let pass = soft::Pass::Render(descriptor);
-                journal.passes
-                    .push((pass, journal.render_commands.len()..0));
+                journal.passes.alloc().init((
+                    soft::Pass::Render(descriptor),
+                    journal.render_commands.len() .. 0,
+                ));
                 PreRender::Deferred(&mut journal.resources, &mut journal.render_commands)
             }
             #[cfg(feature = "dispatch")]
@@ -1044,7 +1109,7 @@ impl CommandSink {
 
     /// Issue provided blit commands. This function doesn't expect an active blit pass,
     /// it will automatically start one when needed.
-    fn blit_commands<'a, I>(&mut self, commands: I)
+    fn blit_commands<I>(&mut self, commands: I)
     where
         I: Iterator<Item = soft::BlitCommand>,
     {
@@ -1080,9 +1145,10 @@ impl CommandSink {
                 if let Some(&(soft::Pass::Blit, _)) = journal.passes.last() {
                 } else {
                     journal.stop();
-                    journal
-                        .passes
-                        .push((soft::Pass::Blit, journal.blit_commands.len()..0));
+                    journal.passes.alloc().init((
+                        soft::Pass::Blit,
+                        journal.blit_commands.len() .. 0,
+                    ));
                 }
                 PreBlit::Deferred(&mut journal.blit_commands)
             }
@@ -1182,9 +1248,10 @@ impl CommandSink {
                     false
                 } else {
                     journal.stop();
-                    journal
-                        .passes
-                        .push((soft::Pass::Compute, journal.compute_commands.len()..0));
+                    journal.passes.alloc().init((
+                        soft::Pass::Compute,
+                        journal.compute_commands.len() .. 0,
+                    ));
                     true
                 };
                 (
@@ -1243,6 +1310,7 @@ pub struct IndexBuffer<B> {
     stride: u32,
 }
 
+#[derive(Debug)]
 pub struct CommandBufferInner {
     sink: Option<CommandSink>,
     level: com::RawLevel,
@@ -1329,7 +1397,7 @@ fn div(a: u32, b: u32) -> u32 {
     (a + b - 1) / b
 }
 
-fn compute_pitches(region: &com::BufferImageCopy, fd: &FormatDesc, extent: &MTLSize) -> (u32, u32) {
+fn compute_pitches(region: &com::BufferImageCopy, fd: FormatDesc, extent: &MTLSize) -> (u32, u32) {
     let buffer_width = if region.buffer_width == 0 {
         extent.width as u32
     } else {
@@ -1356,7 +1424,7 @@ where
     R::RenderPipeline: Borrow<metal::RenderPipelineStateRef>,
     C: Borrow<soft::RenderCommand<R>>,
 {
-    use soft::RenderCommand as Cmd;
+    use crate::soft::RenderCommand as Cmd;
     match *command.borrow() {
         Cmd::SetViewport(ref rect, ref depth) => {
             encoder.set_viewport(MTLViewport {
@@ -1390,6 +1458,7 @@ where
         Cmd::SetRasterizerState(ref rs) => {
             encoder.set_front_facing_winding(rs.front_winding);
             encoder.set_cull_mode(rs.cull_mode);
+            encoder.set_triangle_fill_mode(rs.fill_mode);
             if let Some(depth_clip) = rs.depth_clip {
                 encoder.set_depth_clip_mode(depth_clip);
             }
@@ -1417,7 +1486,7 @@ where
             index,
             ref buffers,
         } => {
-            use soft::AsSlice;
+            use crate::soft::AsSlice;
             let values: &[Option<BufferPtr>] = buffers.as_slice(resources);
             if !values.is_empty() {
                 let data = unsafe {
@@ -1457,7 +1526,7 @@ where
             index,
             ref textures,
         } => {
-            use soft::AsSlice;
+            use crate::soft::AsSlice;
             let values = textures.as_slice(resources);
             if !values.is_empty() {
                 let data = unsafe {
@@ -1476,7 +1545,7 @@ where
             index,
             ref samplers,
         } => {
-            use soft::AsSlice;
+            use crate::soft::AsSlice;
             let values = samplers.as_slice(resources);
             if !values.is_empty() {
                 let data = unsafe {
@@ -1492,6 +1561,9 @@ where
         }
         Cmd::BindPipeline(ref pipeline_state) => {
             encoder.set_render_pipeline_state(pipeline_state.borrow());
+        }
+        Cmd::UseResource { resource, usage } => {
+            encoder.use_resource(resource.as_native(), usage);
         }
         Cmd::Draw {
             primitive_type,
@@ -1600,7 +1672,7 @@ fn exec_blit<C>(encoder: &metal::BlitCommandEncoderRef, command: C)
 where
     C: Borrow<soft::BlitCommand>,
 {
-    use soft::BlitCommand as Cmd;
+    use crate::soft::BlitCommand as Cmd;
     match *command.borrow() {
         Cmd::FillBuffer {
             dst,
@@ -1664,7 +1736,7 @@ where
         } => {
             let extent = conv::map_extent(region.image_extent);
             let origin = conv::map_offset(region.image_offset);
-            let (row_pitch, slice_pitch) = compute_pitches(&region, &dst_desc, &extent);
+            let (row_pitch, slice_pitch) = compute_pitches(&region, dst_desc, &extent);
             let r = &region.image_layers;
 
             for layer in r.layers.clone() {
@@ -1692,7 +1764,7 @@ where
         } => {
             let extent = conv::map_extent(region.image_extent);
             let origin = conv::map_offset(region.image_offset);
-            let (row_pitch, slice_pitch) = compute_pitches(&region, &src_desc, &extent);
+            let (row_pitch, slice_pitch) = compute_pitches(&region, src_desc, &extent);
             let r = &region.image_layers;
 
             for layer in r.layers.clone() {
@@ -1725,7 +1797,7 @@ where
     R::ComputePipeline: Borrow<metal::ComputePipelineStateRef>,
     C: Borrow<soft::ComputeCommand<R>>,
 {
-    use soft::ComputeCommand as Cmd;
+    use crate::soft::ComputeCommand as Cmd;
     match *command.borrow() {
         Cmd::BindBuffer {
             index,
@@ -1736,7 +1808,7 @@ where
             encoder.set_buffer(index as _, native, offset);
         }
         Cmd::BindBuffers { index, ref buffers } => {
-            use soft::AsSlice;
+            use crate::soft::AsSlice;
             let values: &[Option<BufferPtr>] = buffers.as_slice(resources);
             if !values.is_empty() {
                 let data = unsafe {
@@ -1759,7 +1831,7 @@ where
             index,
             ref textures,
         } => {
-            use soft::AsSlice;
+            use crate::soft::AsSlice;
             let values = textures.as_slice(resources);
             if !values.is_empty() {
                 let data = unsafe {
@@ -1773,7 +1845,7 @@ where
             index,
             ref samplers,
         } => {
-            use soft::AsSlice;
+            use crate::soft::AsSlice;
             let values = samplers.as_slice(resources);
             if !values.is_empty() {
                 let data = unsafe {
@@ -1785,6 +1857,9 @@ where
         }
         Cmd::BindPipeline(ref pipeline) => {
             encoder.set_compute_pipeline_state(pipeline.borrow());
+        }
+        Cmd::UseResource { resource, usage } => {
+            encoder.use_resource(resource.as_native(), usage);
         }
         Cmd::Dispatch { wg_size, wg_count } => {
             encoder.dispatch_thread_groups(wg_count, wg_size);
@@ -1799,7 +1874,8 @@ where
     }
 }
 
-#[derive(Default)]
+
+#[derive(Default, Debug)]
 struct PerformanceCounters {
     immediate_command_buffers: usize,
     deferred_command_buffers: usize,
@@ -1810,6 +1886,7 @@ struct PerformanceCounters {
     frame: usize,
 }
 
+#[derive(Debug)]
 pub struct CommandQueue {
     shared: Arc<Shared>,
     retained_buffers: Vec<metal::Buffer>,
@@ -1875,7 +1952,11 @@ impl CommandQueue {
 impl RawCommandQueue<Backend> for CommandQueue {
     unsafe fn submit<'a, T, Ic, S, Iw, Is>(
         &mut self,
-        submit: Submission<Ic, Iw, Is>,
+        Submission {
+            command_buffers,
+            wait_semaphores,
+            signal_semaphores,
+        }: Submission<Ic, Iw, Is>,
         fence: Option<&native::Fence>,
     ) where
         T: 'a + Borrow<CommandBuffer>,
@@ -1884,12 +1965,9 @@ impl RawCommandQueue<Backend> for CommandQueue {
         Iw: IntoIterator<Item = (&'a S, pso::PipelineStage)>,
         Is: IntoIterator<Item = &'a S>,
     {
+        use smallvec::SmallVec;
+
         debug!("submitting with fence {:?}", fence);
-        let Submission {
-            command_buffers,
-            wait_semaphores,
-            signal_semaphores,
-        } = submit;
         self.wait(wait_semaphores.into_iter().map(|(s, _)| s));
 
         const BLOCK_BUCKET: usize = 4;
@@ -1978,6 +2056,7 @@ impl RawCommandQueue<Backend> for CommandQueue {
             }
 
             if do_signal || !self.active_visibility_queries.is_empty() {
+                //Note: there is quite a bit copying here
                 let free_buffers = self
                     .retained_buffers
                     .drain(..)
@@ -1996,7 +2075,7 @@ impl RawCommandQueue<Backend> for CommandQueue {
                     Some((Arc::clone(&self.shared), queries))
                 };
 
-                let block = ConcreteBlock::new(move |_cb: *mut ()| -> () {
+                let block = ConcreteBlock::new(move |_cb: *mut ()| {
                     // signal the semaphores
                     for semaphore in &system_semaphores {
                         semaphore.signal();
@@ -2030,7 +2109,8 @@ impl RawCommandQueue<Backend> for CommandQueue {
                 cmd_buffer.commit();
 
                 if let Some(fence) = fence {
-                    *fence.0.borrow_mut() = native::FenceInner::Pending(cmd_buffer.to_owned());
+                    debug!("\tmarking fence ptr {:?} as pending", fence.0.as_ptr());
+                    fence.0.replace(native::FenceInner::PendingSubmission(cmd_buffer.to_owned()));
                 }
             } else if let Some(cmd_buffer) = deferred_cmd_buffer {
                 cmd_buffer.commit();
@@ -2055,7 +2135,7 @@ impl RawCommandQueue<Backend> for CommandQueue {
         &mut self,
         swapchains: Is,
         wait_semaphores: Iw,
-    ) -> Result<(), ()>
+    ) -> Result<Option<Suboptimal>, PresentError>
     where
         W: 'a + Borrow<window::Swapchain>,
         Is: IntoIterator<Item = (&'a W, SwapImageIndex)>,
@@ -2072,7 +2152,7 @@ impl RawCommandQueue<Backend> for CommandQueue {
 
             for (swapchain, index) in swapchains {
                 debug!("presenting frame {}", index);
-                let drawable = swapchain.borrow().take_drawable(index)?;
+                let drawable = swapchain.borrow().take_drawable(index).map_err(|()| PresentError::OutOfDate)?; // What `Err(())` represents?
                 command_buffer.present_drawable(&drawable);
             }
             command_buffer.commit();
@@ -2108,7 +2188,7 @@ impl RawCommandQueue<Backend> for CommandQueue {
             }
         }
 
-        Ok(())
+        Ok(None)
     }
 
     fn wait_idle(&self) -> Result<(), error::HostExecutionError> {
@@ -2118,9 +2198,9 @@ impl RawCommandQueue<Backend> for CommandQueue {
 }
 
 impl pool::RawCommandPool<Backend> for CommandPool {
-    unsafe fn reset(&mut self) {
+    unsafe fn reset(&mut self, release_resources: bool) {
         for cmd_buffer in &self.allocated {
-            cmd_buffer.borrow_mut().reset(&self.shared, false);
+            cmd_buffer.borrow_mut().reset(&self.shared, release_resources);
         }
     }
 
@@ -2177,6 +2257,9 @@ impl pool::RawCommandPool<Backend> for CommandPool {
                 target_formats: native::SubpassFormats::default(),
                 visibility_query: (metal::MTLVisibilityResultMode::Disabled, 0),
                 pending_subpasses: Vec::new(),
+                descriptor_sets: (0 .. MAX_BOUND_DESCRIPTOR_SETS)
+                    .map(|_| DescriptorSetInfo::default())
+                    .collect(),
             },
             temp: Temp {
                 clear_vertices: Vec::new(),
@@ -2191,7 +2274,7 @@ impl pool::RawCommandPool<Backend> for CommandPool {
     where
         I: IntoIterator<Item = CommandBuffer>,
     {
-        use hal::command::RawCommandBuffer;
+        use self::hal::command::RawCommandBuffer;
         for mut cmd_buf in cmd_buffers {
             cmd_buf.reset(true);
             match self
@@ -2231,8 +2314,8 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         self.reset(false);
 
         let mut inner = self.inner.borrow_mut();
-        let can_immediate = inner.level == com::RawLevel::Primary &&
-            flags.contains(com::CommandBufferFlags::ONE_TIME_SUBMIT);
+        let can_immediate = inner.level == com::RawLevel::Primary
+            && flags.contains(com::CommandBufferFlags::ONE_TIME_SUBMIT);
         let sink = match self.pool_shared.borrow_mut().online_recording {
             OnlineRecording::Immediate if can_immediate => {
                 let (cmd_buffer, token) = self.shared.queue.lock().spawn();
@@ -2291,9 +2374,9 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
                 Some(CommandSink::Deferred { ref mut is_encoding, ref mut journal, .. }) => {
                     *is_encoding = true;
                     let pass_desc = metal::RenderPassDescriptor::new().to_owned();
-                    journal.passes.push((soft::Pass::Render(pass_desc), 0..0));
+                    journal.passes.alloc().init((soft::Pass::Render(pass_desc), 0..0));
                 }
-                _ => unreachable!()
+                _ => unreachable!(),
             }
         }
     }
@@ -2338,7 +2421,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
             None => base_range.end,
         };
 
-        if (data & 0xFF) * 0x1010101 == data {
+        if (data & 0xFF) * 0x0101_0101 == data {
             let command = soft::BlitCommand::FillBuffer {
                 dst: AsNative::from(raw),
                 range: start..end,
@@ -2568,7 +2651,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
 
                 for &index in &[0usize, 1, 2, 2, 3, 0] {
                     let d = data[index];
-                    vertices.push(ClearVertex {
+                    vertices.alloc().init(ClearVertex {
                         pos: [
                             d[0] as f32 / de.width as f32,
                             d[1] as f32 / de.height as f32,
@@ -2615,7 +2698,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
                     let channel = self.state.target_formats.colors[index].1;
                     //Note: technically we should be able to derive the Channel from the
                     // `value` variant, but this is blocked by the portability that is
-                    // always passing the attachment clears as `ClearColor::Float` atm.
+                    // always passing the attachment clears as `ClearColor::Sfloat` atm.
                     raw_value = com::ClearColorRaw::from(value);
                     let com = soft::RenderCommand::BindBufferData {
                         stage: pso::Stage::Fragment,
@@ -2636,7 +2719,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
                         vertex_is_dirty = true;
                         aspects |= Aspects::DEPTH;
                     }
-                    if let Some(_) = stencil {
+                    if stencil.is_some() {
                         //TODO: soft::RenderCommand::SetStencilReference
                         aspects |= Aspects::STENCIL;
                     }
@@ -2841,7 +2924,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
                 .zip(r.dst_subresource.layers.clone());
             let list = vertices
                 .entry((r.dst_subresource.aspects, r.dst_subresource.level))
-                .or_insert(Vec::new());
+                .or_insert_with(Vec::new);
 
             for (src_layer, dst_layer) in layers {
                 // this helper array defines unique data for quad vertices
@@ -2878,7 +2961,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
 
                 for &index in &[0usize, 1, 2, 2, 3, 0] {
                     let d = data[index];
-                    list.push(BlitVertex {
+                    list.alloc().init(BlitVertex {
                         uv: [
                             d[0] as f32 / se.width as f32,
                             d[1] as f32 / se.height as f32,
@@ -3019,7 +3102,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         });
     }
 
-    unsafe fn bind_vertex_buffers<I, T>(&mut self, first_binding: u32, buffers: I)
+    unsafe fn bind_vertex_buffers<I, T>(&mut self, first_binding: pso::BufferIndex, buffers: I)
     where
         I: IntoIterator<Item = (T, buffer::Offset)>,
         T: Borrow<native::Buffer>,
@@ -3034,16 +3117,12 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
             let (raw, range) = b.as_bound();
             let buffer_ptr = AsNative::from(raw);
             let index = first_binding as usize + i;
-            let value = Some((buffer_ptr, range.start + offset));
-            if index >= self.state.vertex_buffers.len() {
-                debug_assert_eq!(index, self.state.vertex_buffers.len());
-                self.state.vertex_buffers.push(value);
-            } else {
-                self.state.vertex_buffers[index] = value;
-            }
+            self.state.vertex_buffers
+                .entry(index)
+                .set(Some((buffer_ptr, range.start + offset)));
         }
 
-        if let Some(command) = self.state.set_vertex_buffers() {
+        if let Some(command) = self.state.set_vertex_buffers(self.shared.private_caps.max_buffers_per_stage as usize) {
             self.inner.borrow_mut().sink().pre_render().issue(command);
         }
     }
@@ -3067,7 +3146,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
             panic!("More than one viewport set; Metal supports only one viewport");
         }
 
-        let com = self.state.set_viewport(vp, &self.shared.disabilities);
+        let com = self.state.set_viewport(vp, self.shared.disabilities);
         self.inner.borrow_mut().sink().pre_render().issue(com);
     }
 
@@ -3089,7 +3168,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
             panic!("More than one scissor set; Metal supports only one viewport");
         }
 
-        let com = self.state.set_scissor(rect);
+        let com = self.state.set_scissor(*rect);
         self.inner.borrow_mut().sink().pre_render().issue(com);
     }
 
@@ -3103,7 +3182,10 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
     }
 
     unsafe fn set_line_width(&mut self, width: f32) {
-        validate_line_width(width);
+        // Note from the Vulkan spec:
+        // > If the wide lines feature is not enabled, lineWidth must be 1.0
+        // Simply assert and no-op because Metal never exposes `Features::LINE_WIDTH`
+        assert_eq!(width, 1.0);
     }
 
     unsafe fn set_depth_bias(&mut self, depth_bias: pso::DepthBias) {
@@ -3158,7 +3240,6 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         T::Item: Borrow<com::ClearValueRaw>,
     {
         // fill out temporary clear values per attachment
-        self.temp.clear_values.clear();
         self.temp
             .clear_values
             .resize(render_pass.attachments.len(), None);
@@ -3170,7 +3251,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
             .filter(|(_, rat)| rat.has_clears())
             .zip(clear_values)
         {
-            *out_val = Some(in_val.borrow().clone());
+            *out_val = Some(*in_val.borrow());
         }
 
         self.state.pending_subpasses.clear();
@@ -3180,72 +3261,76 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         // we stack the subpasses in the opposite order
         for subpass in render_pass.subpasses.iter().rev() {
             let mut combined_aspects = Aspects::empty();
-            let descriptor = metal::RenderPassDescriptor::new().to_owned();
-            descriptor.set_visibility_result_buffer(Some(&self.shared.visibility.buffer));
-            if self.shared.private_caps.layered_rendering {
-                descriptor.set_render_target_array_length(framebuffer.extent.depth as _);
-            }
-
-            for (i, &(at_id, op_flags)) in subpass.colors.iter().enumerate() {
-                let rat = &render_pass.attachments[at_id];
-                let texture = &framebuffer.attachments[at_id];
-                let desc = descriptor.color_attachments().object_at(i as _).unwrap();
-
-                combined_aspects |= Aspects::COLOR;
-                desc.set_texture(Some(texture));
-
-                if op_flags.contains(native::SubpassOps::LOAD) {
-                    desc.set_load_action(conv::map_load_operation(rat.ops.load));
-                    if rat.ops.load == AttachmentLoadOp::Clear {
-                        let channel = subpass.target_formats.colors[i].1;
-                        let raw = self.temp.clear_values[at_id].unwrap().color;
-                        desc.set_clear_color(channel.interpret(raw));
-                    }
+            let descriptor = autoreleasepool(|| {
+                let descriptor = metal::RenderPassDescriptor::new().to_owned();
+                descriptor.set_visibility_result_buffer(Some(&self.shared.visibility.buffer));
+                if self.shared.private_caps.layered_rendering {
+                    descriptor.set_render_target_array_length(framebuffer.extent.depth as _);
                 }
-                if op_flags.contains(native::SubpassOps::STORE) {
-                    desc.set_store_action(conv::map_store_operation(rat.ops.store));
-                }
-            }
 
-            if let Some((at_id, op_flags)) = subpass.depth_stencil {
-                let rat = &render_pass.attachments[at_id];
-                let texture = &framebuffer.attachments[at_id];
-                let aspects = rat.format.unwrap().surface_desc().aspects;
-                combined_aspects |= aspects;
+                for (i, &(at_id, op_flags)) in subpass.colors.iter().enumerate() {
+                    let rat = &render_pass.attachments[at_id];
+                    let texture = &framebuffer.attachments[at_id];
+                    let desc = descriptor.color_attachments().object_at(i as _).unwrap();
 
-                if aspects.contains(Aspects::DEPTH) {
-                    let desc = descriptor.depth_attachment().unwrap();
+                    combined_aspects |= Aspects::COLOR;
                     desc.set_texture(Some(texture));
 
                     if op_flags.contains(native::SubpassOps::LOAD) {
                         desc.set_load_action(conv::map_load_operation(rat.ops.load));
                         if rat.ops.load == AttachmentLoadOp::Clear {
-                            let raw = self.temp.clear_values[at_id].unwrap().depth_stencil;
-                            desc.set_clear_depth(raw.depth as f64);
+                            let channel = subpass.target_formats.colors[i].1;
+                            let raw = self.temp.clear_values[at_id].unwrap().color;
+                            desc.set_clear_color(channel.interpret(raw));
                         }
                     }
                     if op_flags.contains(native::SubpassOps::STORE) {
                         desc.set_store_action(conv::map_store_operation(rat.ops.store));
                     }
                 }
-                if aspects.contains(Aspects::STENCIL) {
-                    let desc = descriptor.stencil_attachment().unwrap();
-                    desc.set_texture(Some(texture));
 
-                    if op_flags.contains(native::SubpassOps::LOAD) {
-                        desc.set_load_action(conv::map_load_operation(rat.stencil_ops.load));
-                        if rat.stencil_ops.load == AttachmentLoadOp::Clear {
-                            let raw = self.temp.clear_values[at_id].unwrap().depth_stencil;
-                            desc.set_clear_stencil(raw.stencil);
+                if let Some((at_id, op_flags)) = subpass.depth_stencil {
+                    let rat = &render_pass.attachments[at_id];
+                    let texture = &framebuffer.attachments[at_id];
+                    let aspects = rat.format.unwrap().surface_desc().aspects;
+                    combined_aspects |= aspects;
+
+                    if aspects.contains(Aspects::DEPTH) {
+                        let desc = descriptor.depth_attachment().unwrap();
+                        desc.set_texture(Some(texture));
+
+                        if op_flags.contains(native::SubpassOps::LOAD) {
+                            desc.set_load_action(conv::map_load_operation(rat.ops.load));
+                            if rat.ops.load == AttachmentLoadOp::Clear {
+                                let raw = self.temp.clear_values[at_id].unwrap().depth_stencil;
+                                desc.set_clear_depth(raw.depth as f64);
+                            }
+                        }
+                        if op_flags.contains(native::SubpassOps::STORE) {
+                            desc.set_store_action(conv::map_store_operation(rat.ops.store));
                         }
                     }
-                    if op_flags.contains(native::SubpassOps::STORE) {
-                        desc.set_store_action(conv::map_store_operation(rat.stencil_ops.store));
+                    if aspects.contains(Aspects::STENCIL) {
+                        let desc = descriptor.stencil_attachment().unwrap();
+                        desc.set_texture(Some(texture));
+
+                        if op_flags.contains(native::SubpassOps::LOAD) {
+                            desc.set_load_action(conv::map_load_operation(rat.stencil_ops.load));
+                            if rat.stencil_ops.load == AttachmentLoadOp::Clear {
+                                let raw = self.temp.clear_values[at_id].unwrap().depth_stencil;
+                                desc.set_clear_stencil(raw.stencil);
+                            }
+                        }
+                        if op_flags.contains(native::SubpassOps::STORE) {
+                            desc.set_store_action(conv::map_store_operation(rat.stencil_ops.store));
+                        }
                     }
                 }
-            }
 
-            self.state.pending_subpasses.push(SubpassInfo {
+                descriptor
+            });
+
+            self.state.pending_subpasses.alloc().init(SubpassInfo {
                 descriptor,
                 combined_aspects,
                 formats: subpass.target_formats.clone(),
@@ -3330,109 +3415,91 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         let mut inner = self.inner.borrow_mut();
         let mut pre = inner.sink().pre_render();
 
-        self.state.render_pso_is_compatible = true; //assume good intent :)
-        let mut old_attribute_buffer_index = 0;
-        let set_pipeline = match self.state.render_pso {
-            Some(ref ps) if ps.raw.as_ptr() == pipeline.raw.as_ptr() => {
-                false // chill out
-            }
-            Some(ref mut ps) => {
-                old_attribute_buffer_index = ps.attribute_buffer_index;
-                ps.raw = pipeline.raw.to_owned();
-                ps.vertex_buffers.clear();
-                ps.vertex_buffers
-                    .extend(pipeline.vertex_buffers.iter().cloned().map(Some));
-                ps.attribute_buffer_index = pipeline.attribute_buffer_index;
-                ps.ds_desc = pipeline.depth_stencil_desc.clone();
-                ps.formats.copy_from(&pipeline.attachment_formats);
-                true
-            }
-            None => {
-                self.state.render_pso = Some(RenderPipelineState {
-                    raw: pipeline.raw.to_owned(),
-                    ds_desc: pipeline.depth_stencil_desc.clone(),
-                    vertex_buffers: pipeline.vertex_buffers.iter().cloned().map(Some).collect(),
-                    attribute_buffer_index: pipeline.attribute_buffer_index,
-                    formats: pipeline.attachment_formats.clone(),
-                });
-                true
-            }
-        };
-        if set_pipeline {
-            self.state.rasterizer_state = pipeline.rasterizer_state.clone();
-            self.state.primitive_type = pipeline.primitive_type;
-
-            pre.issue(soft::RenderCommand::BindPipeline(&*pipeline.raw));
-            if let Some(ref rs) = pipeline.rasterizer_state {
-                pre.issue(soft::RenderCommand::SetRasterizerState(rs.clone()))
-            }
-            // re-bind vertex buffers
-            if let Some(command) = self.state.set_vertex_buffers() {
-                pre.issue(command);
-            }
-            // Note: all VS resources past the `old_attribute_buffer_index` have to be re-bound
-            // but ones after `pipeline.attribute_buffer_index` are already covered by `set_vertex_buffers()`.
-            // re-bind damaged VS buffers
-            let vs_end = cmp::min(
-                self.state.resources_vs.buffers.len(),
-                pipeline.attribute_buffer_index as usize,
-            );
-            if vs_end > old_attribute_buffer_index as usize {
-                pre.issue(soft::RenderCommand::BindBuffers {
-                    stage: pso::Stage::Vertex,
-                    index: old_attribute_buffer_index,
-                    buffers: (
-                        &self.state.resources_vs.buffers
-                            [old_attribute_buffer_index as usize..vs_end],
-                        &self.state.resources_vs.buffer_offsets
-                            [old_attribute_buffer_index as usize..vs_end],
-                    ),
-                });
-            }
-            // re-bind push constants
-            if let Some(pc) = pipeline.vs_pc_info {
-                if Some(pc) != self.state.resources_vs.push_constants
-                    || pc.buffer_index >= old_attribute_buffer_index
-                {
-                    // if we don't have enough constants, then binding will follow
-                    if pc.count as usize <= self.state.push_constants.len() {
-                        pre.issue(self.state.push_vs_constants(pc));
-                    }
-                }
-            }
-            if let Some(pc) = pipeline.ps_pc_info {
-                if Some(pc) != self.state.resources_ps.push_constants {
-                    if pc.count as usize <= self.state.push_constants.len() {
-                        pre.issue(self.state.push_ps_constants(pc));
-                    }
-                }
-            }
-        } else {
-            debug_assert_eq!(self.state.rasterizer_state, pipeline.rasterizer_state);
-            debug_assert_eq!(self.state.primitive_type, pipeline.primitive_type);
-        }
-
-        if let Some(desc) = self.state.build_depth_stencil() {
-            let ds_store = &self.shared.service_pipes.depth_stencil_states;
-            let state = &**ds_store.get(desc, &self.shared.device);
-            pre.issue(soft::RenderCommand::SetDepthStencilState(state));
-        }
-
         if set_stencil_references {
             pre.issue(soft::RenderCommand::SetStencilReferenceValues(
                 self.state.stencil.front_reference,
                 self.state.stencil.back_reference,
             ));
         }
+
+        self.state.render_pso_is_compatible = pipeline.attachment_formats == self.state.target_formats;
+        let set_pipeline = match self.state.render_pso {
+            Some(ref ps) if ps.raw.as_ptr() == pipeline.raw.as_ptr() => false,
+            Some(ref mut ps) => {
+                ps.raw = pipeline.raw.to_owned();
+                ps.vertex_buffers.clear();
+                ps.vertex_buffers
+                    .extend(pipeline.vertex_buffers.iter().cloned().map(Some));
+                ps.ds_desc = pipeline.depth_stencil_desc;
+                ps.formats.copy_from(&pipeline.attachment_formats);
+                true
+            }
+            None => {
+                self.state.render_pso = Some(RenderPipelineState {
+                    raw: pipeline.raw.to_owned(),
+                    ds_desc: pipeline.depth_stencil_desc,
+                    vertex_buffers: pipeline.vertex_buffers.iter().cloned().map(Some).collect(),
+                    formats: pipeline.attachment_formats.clone(),
+                });
+                true
+            }
+        };
+
+        if self.state.render_pso_is_compatible {
+            if set_pipeline {
+                self.state.rasterizer_state = pipeline.rasterizer_state.clone();
+                self.state.primitive_type = pipeline.primitive_type;
+
+                pre.issue(soft::RenderCommand::BindPipeline(&*pipeline.raw));
+                if let Some(ref rs) = pipeline.rasterizer_state {
+                    pre.issue(soft::RenderCommand::SetRasterizerState(rs.clone()))
+                }
+                // re-bind vertex buffers
+                if let Some(command) = self.state.set_vertex_buffers(self.shared.private_caps.max_buffers_per_stage as usize) {
+                    pre.issue(command);
+                }
+                // re-bind push constants
+                if let Some(pc) = pipeline.vs_pc_info {
+                    if Some(pc) != self.state.resources_vs.push_constants {
+                        // if we don't have enough constants, then binding will follow
+                        if pc.count as usize <= self.state.push_constants.len() {
+                            pre.issue(self.state.push_vs_constants(pc));
+                        }
+                    }
+                }
+                if let Some(pc) = pipeline.ps_pc_info {
+                    if Some(pc) != self.state.resources_ps.push_constants
+                        && pc.count as usize <= self.state.push_constants.len()
+                    {
+                            pre.issue(self.state.push_ps_constants(pc));
+                        }
+                    }
+            } else {
+                debug_assert_eq!(self.state.rasterizer_state, pipeline.rasterizer_state);
+                debug_assert_eq!(self.state.primitive_type, pipeline.primitive_type);
+            }
+
+            if let Some(desc) = self.state.build_depth_stencil() {
+                let ds_store = &self.shared.service_pipes.depth_stencil_states;
+                let state = &**ds_store.get(desc, &self.shared.device);
+                pre.issue(soft::RenderCommand::SetDepthStencilState(state));
+            }
+        } else {
+            // This may be tricky: we expect either another pipeline to be bound
+            // (this overwriting these), or a new render pass started (thus using these).
+            self.state.rasterizer_state = pipeline.rasterizer_state.clone();
+            self.state.primitive_type = pipeline.primitive_type;
+        }
+
         if let pso::State::Static(value) = pipeline.depth_bias {
             self.state.depth_bias = value;
             pre.issue(soft::RenderCommand::SetDepthBias(value));
         }
 
         if let Some(ref vp) = pipeline.baked_states.viewport {
-            pre.issue(self.state.set_viewport(vp, &self.shared.disabilities));
+            pre.issue(self.state.set_viewport(vp, self.shared.disabilities));
         }
-        if let Some(ref rect) = pipeline.baked_states.scissor {
+        if let Some(rect) = pipeline.baked_states.scissor {
             pre.issue(self.state.set_scissor(rect));
         }
         if let Some(ref color) = pipeline.baked_states.blend_color {
@@ -3440,7 +3507,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         }
     }
 
-    unsafe fn bind_graphics_descriptor_sets<'a, I, J>(
+    unsafe fn bind_graphics_descriptor_sets<I, J>(
         &mut self,
         pipe_layout: &native::PipelineLayout,
         first_set: usize,
@@ -3452,6 +3519,11 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         J: IntoIterator,
         J::Item: Borrow<com::DescriptorSetOffset>,
     {
+        let vbuf_count = self.state.render_pso
+            .as_ref()
+            .map_or(0, |pso| pso.vertex_buffers.len()) as ResourceIndex;
+        assert!(pipe_layout.total.vs.buffers + vbuf_count <= self.shared.private_caps.max_buffers_per_stage);
+
         self.state.resources_vs.pre_allocate(&pipe_layout.total.vs);
         self.state.resources_ps.pre_allocate(&pipe_layout.total.ps);
 
@@ -3466,7 +3538,11 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
                 cs: first.cs.map(|&i| i..i),
             }
         };
-        for (info, desc_set) in pipe_layout.infos[first_set..].iter().zip(sets) {
+        for ((info, desc_set), cached_ds) in pipe_layout.infos[first_set..]
+            .iter()
+            .zip(sets)
+            .zip(self.state.descriptor_sets[first_set..].iter_mut())
+        {
             match *desc_set.borrow() {
                 native::DescriptorSet::Emulated {
                     ref pool,
@@ -3509,7 +3585,9 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
                 }
                 native::DescriptorSet::ArgumentBuffer {
                     ref raw,
-                    offset,
+                    raw_offset,
+                    ref pool,
+                    ref range,
                     stage_flags,
                     ..
                 } => {
@@ -3518,25 +3596,43 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
                         let index = info.offsets.vs.buffers;
                         self.state.resources_vs.buffers[index as usize] =
                             Some(AsNative::from(raw.as_ref()));
-                        self.state.resources_vs.buffer_offsets[index as usize] = offset;
+                        self.state.resources_vs.buffer_offsets[index as usize] = raw_offset;
                         pre.issue(soft::RenderCommand::BindBuffer {
                             stage: pso::Stage::Vertex,
                             index,
                             buffer: AsNative::from(raw.as_ref()),
-                            offset,
+                            offset: raw_offset,
                         });
                     }
                     if stage_flags.contains(pso::ShaderStageFlags::FRAGMENT) {
                         let index = info.offsets.ps.buffers;
                         self.state.resources_ps.buffers[index as usize] =
                             Some(AsNative::from(raw.as_ref()));
-                        self.state.resources_ps.buffer_offsets[index as usize] = offset;
+                        self.state.resources_ps.buffer_offsets[index as usize] = raw_offset;
                         pre.issue(soft::RenderCommand::BindBuffer {
                             stage: pso::Stage::Fragment,
                             index,
                             buffer: AsNative::from(raw.as_ref()),
-                            offset,
+                            offset: raw_offset,
                         });
+                    }
+                    if stage_flags.intersects(pso::ShaderStageFlags::VERTEX | pso::ShaderStageFlags::FRAGMENT) {
+                        cached_ds.graphics_resources.clear();
+                        cached_ds.graphics_resources.extend(pool
+                            .read()
+                            .resources[range.start as usize .. range.end as usize]
+                            .iter()
+                            .filter_map(|ur| {
+                                ptr::NonNull::new(ur.ptr).map(|res| (res, ur.usage))
+                            })
+                        );
+                        pre.issue_many(cached_ds.graphics_resources
+                            .iter()
+                            .map(|&(resource, usage)| soft::RenderCommand::UseResource {
+                                resource,
+                                usage,
+                            })
+                        );
                     }
                 }
             }
@@ -3591,15 +3687,15 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         pre.issue(soft::ComputeCommand::BindPipeline(&*pipeline.raw));
 
         if let Some(pc) = pipeline.pc_info {
-            if Some(pc) != self.state.resources_cs.push_constants {
-                if pc.count as usize <= self.state.push_constants.len() {
+            if Some(pc) != self.state.resources_cs.push_constants
+                && pc.count as usize <= self.state.push_constants.len()
+            {
                     pre.issue(self.state.push_cs_constants(pc));
                 }
             }
-        }
     }
 
-    unsafe fn bind_compute_descriptor_sets<'a, I, J>(
+    unsafe fn bind_compute_descriptor_sets<I, J>(
         &mut self,
         pipe_layout: &native::PipelineLayout,
         first_set: usize,
@@ -3619,7 +3715,11 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         let cache = &mut self.state.resources_cs;
         let mut bind_range = pipe_layout.infos[first_set].offsets.cs.map(|&i| i..i);
 
-        for (info, desc_set) in pipe_layout.infos[first_set..].iter().zip(sets) {
+        for ((info, desc_set), cached_ds) in pipe_layout.infos[first_set..]
+            .iter()
+            .zip(sets)
+            .zip(self.state.descriptor_sets[first_set..].iter_mut())
+        {
             let res_offset = &info.offsets.cs;
             match *desc_set.borrow() {
                 native::DescriptorSet::Emulated {
@@ -3651,19 +3751,38 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
                 }
                 native::DescriptorSet::ArgumentBuffer {
                     ref raw,
-                    offset,
+                    raw_offset,
+                    ref pool,
+                    ref range,
                     stage_flags,
                     ..
                 } => {
                     if stage_flags.contains(pso::ShaderStageFlags::COMPUTE) {
                         let index = res_offset.buffers;
                         cache.buffers[index as usize] = Some(AsNative::from(raw.as_ref()));
-                        cache.buffer_offsets[index as usize] = offset;
+                        cache.buffer_offsets[index as usize] = raw_offset;
                         pre.issue(soft::ComputeCommand::BindBuffer {
                             index,
                             buffer: AsNative::from(raw.as_ref()),
-                            offset,
+                            offset: raw_offset,
                         });
+
+                        cached_ds.compute_resources.clear();
+                        cached_ds.compute_resources.extend(pool
+                            .read()
+                            .resources[range.start as usize .. range.end as usize]
+                            .iter()
+                            .filter_map(|ur| {
+                                ptr::NonNull::new(ur.ptr).map(|res| (res, ur.usage))
+                            })
+                        );
+                        pre.issue_many(cached_ds.compute_resources
+                            .iter()
+                            .map(|&(resource, usage)| soft::ComputeCommand::UseResource {
+                                resource,
+                                usage,
+                            })
+                        );
                     }
                 }
             }
@@ -3758,7 +3877,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
                 && r.src % WORD_SIZE as u64 == 0
                 && r.dst % WORD_SIZE as u64 == 0
             {
-                blit_commands.push(soft::BlitCommand::CopyBuffer {
+                blit_commands.alloc().init(soft::BlitCommand::CopyBuffer {
                     src: AsNative::from(src_raw),
                     dst: AsNative::from(dst_raw),
                     region: com::BufferCopy {
@@ -3782,23 +3901,23 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
                     depth: 1,
                 };
 
-                compute_commands.push(soft::ComputeCommand::BindBuffer {
+                compute_commands.alloc().init(soft::ComputeCommand::BindBuffer {
                     index: 0,
                     buffer: AsNative::from(dst_raw),
                     offset: dst_aligned + dst_range.start,
                 });
-                compute_commands.push(soft::ComputeCommand::BindBuffer {
+                compute_commands.alloc().init(soft::ComputeCommand::BindBuffer {
                     index: 1,
                     buffer: AsNative::from(src_raw),
                     offset: src_aligned + src_range.start,
                 });
-                compute_commands.push(soft::ComputeCommand::BindBufferData {
+                compute_commands.alloc().init(soft::ComputeCommand::BindBufferData {
                     index: 2,
                     // Rust doesn't see that compute_datas will not lose this
                     // item and the boxed contents can't be moved otherwise.
                     words: mem::transmute(&compute_datas.last().unwrap()[..]),
                 });
-                compute_commands.push(soft::ComputeCommand::Dispatch { wg_size, wg_count });
+                compute_commands.alloc().init(soft::ComputeCommand::Dispatch { wg_size, wg_count });
             }
         }
 
@@ -4016,6 +4135,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
     }
 
     unsafe fn draw(&mut self, vertices: Range<VertexCount>, instances: Range<InstanceCount>) {
+        debug_assert!(self.state.render_pso_is_compatible);
         if instances.start == instances.end {
             return;
         }
@@ -4034,6 +4154,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
         base_vertex: VertexOffset,
         instances: Range<InstanceCount>,
     ) {
+        debug_assert!(self.state.render_pso_is_compatible);
         if instances.start == instances.end {
             return;
         }
@@ -4061,6 +4182,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
     ) {
         assert_eq!(offset % WORD_ALIGNMENT, 0);
         assert_eq!(stride % WORD_ALIGNMENT as u32, 0);
+        debug_assert!(self.state.render_pso_is_compatible);
         let (raw, range) = buffer.as_bound();
 
         let commands = (0..count).map(|i| soft::RenderCommand::DrawIndirect {
@@ -4085,6 +4207,7 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
     ) {
         assert_eq!(offset % WORD_ALIGNMENT, 0);
         assert_eq!(stride % WORD_ALIGNMENT as u32, 0);
+        debug_assert!(self.state.render_pso_is_compatible);
         let (raw, range) = buffer.as_bound();
 
         let commands = (0..count).map(|i| soft::RenderCommand::DrawIndexedIndirect {
@@ -4103,6 +4226,28 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
             .sink()
             .pre_render()
             .issue_many(commands);
+    }
+
+    unsafe fn set_event(&mut self, _: &(), _: pso::PipelineStage) {
+        unimplemented!()
+    }
+
+    unsafe fn reset_event(&mut self, _: &(), _: pso::PipelineStage) {
+        unimplemented!()
+    }
+
+    unsafe fn wait_events<'a, I, J>(
+        &mut self,
+        _: I,
+        _: Range<pso::PipelineStage>,
+        _: J
+    ) where
+        I: IntoIterator,
+    I::Item: Borrow<()>,
+    J: IntoIterator,
+    J::Item: Borrow<memory::Barrier<'a, Backend>>,
+    {
+        unimplemented!()
     }
 
     unsafe fn begin_query(&mut self, query: query::Query<Backend>, flags: query::ControlFlags) {
@@ -4332,11 +4477,24 @@ impl com::RawCommandBuffer<Backend> for CommandBuffer {
             let inner_borrowed = outer_borrowed.inner.borrow_mut();
 
             let (exec_journal, is_inheriting) = match inner_borrowed.sink {
-                Some(CommandSink::Deferred { ref journal, is_inheriting, .. }) => {
-                    (journal, is_inheriting)
-                }
+                Some(CommandSink::Deferred {
+                    ref journal,
+                    is_inheriting,
+                    ..
+                }) => (journal, is_inheriting),
                 _ => panic!("Unexpected secondary sink!"),
             };
+
+            for (a, b) in self.state.descriptor_sets.iter_mut().zip(&outer_borrowed.state.descriptor_sets) {
+                if !b.graphics_resources.is_empty() {
+                    a.graphics_resources.clear();
+                    a.graphics_resources.extend_from_slice(&b.graphics_resources);
+                }
+                if !b.compute_resources.is_empty() {
+                    a.compute_resources.clear();
+                    a.compute_resources.extend_from_slice(&b.compute_resources);
+                }
+            }
 
             match *self.inner
                 .borrow_mut()

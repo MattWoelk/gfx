@@ -1,74 +1,49 @@
-//! Window creation using glutin for gfx.
-//!
-//! # Examples
-//!
-//! The following code creates a `gfx::Surface` using glutin.
-//!
-//! ```no_run
-//! extern crate glutin;
-//! extern crate gfx_backend_gl;
-//!
-//! fn main() {
-//!     use gfx_backend_gl::Surface;
-//!     use glutin::{EventsLoop, WindowBuilder, ContextBuilder, WindowedContext};
-//!
-//!     // First create a window using glutin.
-//!     let mut events_loop = EventsLoop::new();
-//!     let wb = WindowBuilder::new();
-//!     let glutin_window = ContextBuilder::new().with_vsync(true).build_windowed(wb, &events_loop).unwrap();
-//!     let glutin_window = unsafe { glutin_window.make_current() }.expect("Failed to make the context current");
-//!
-//!     // Then use the glutin window to create a gfx surface.
-//!     let surface = Surface::from_window(glutin_window);
-//! }
-//! ```
-//!
-//! Headless initialization without a window.
-//!
-//! ```no_run
-//! extern crate glutin;
-//! extern crate gfx_backend_gl;
-//! extern crate gfx_hal;
-//!
-//! use gfx_hal::Instance;
-//! use gfx_backend_gl::Headless;
-//! use glutin::{Context, ContextBuilder, EventsLoop};
-//!
-//! fn main() {
-//!     let events_loop = EventsLoop::new();
-//!     let context = ContextBuilder::new().build_headless(&events_loop, glutin::dpi::PhysicalSize::new(0.0, 0.0))
-//!         .expect("Failed to build headless context");
-//!     let context = unsafe { context.make_current() }.expect("Failed to make the context current");
-//!     let headless = Headless::from_context(context);
-//!     let _adapters = headless.enumerate_adapters();
-//! }
-//! ```
-
 use crate::hal::window::Extent2D;
 use crate::hal::{self, format as f, image, memory, CompositeAlpha};
-use crate::{native, Backend as B, Device, GlContainer, PhysicalDevice, QueueFamily, Starc};
+use crate::{native, Backend as B, Device, GlContainer, PhysicalDevice, QueueFamily};
 
 use glow::Context;
 
-use glutin;
-
-fn get_window_extent(window: &glutin::Window) -> image::Extent {
-    let px = window
-        .get_inner_size()
-        .unwrap()
-        .to_physical(window.get_hidpi_factor());
+fn get_window_extent(window: &Window) -> image::Extent {
     image::Extent {
-        width: px.width as image::Size,
-        height: px.height as image::Size,
+        width: 640 as image::Size,
+        height: 480 as image::Size,
         depth: 1,
     }
 }
 
+struct PixelFormat {
+    color_bits: u32,
+    alpha_bits: u32,
+    srgb: bool,
+    double_buffer: bool,
+    multisampling: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Window;
+
+impl Window {
+    fn get_pixel_format(&self) -> PixelFormat {
+        PixelFormat {
+            color_bits: 24,
+            alpha_bits: 8,
+            srgb: false,
+            double_buffer: true,
+            multisampling: None,
+        }
+    }
+
+    pub fn get_hidpi_factor(&self) -> i32 {
+        1
+    }
+
+    pub fn resize<T>(&self, parameter: T) {}
+}
+
 #[derive(Debug)]
 pub struct Swapchain {
-    // Underlying window, required for presentation
-    pub(crate) context: Starc<glutin::WindowedContext<glutin::PossiblyCurrent>>,
-    // Extent because the window lies
+    pub(crate) window: Window,
     pub(crate) extent: Extent2D,
 }
 
@@ -84,31 +59,26 @@ impl hal::Swapchain<B> for Swapchain {
     }
 }
 
-//TODO: if we make `Surface` a `WindowBuilder` instead of `WindowedContext`,
-// we could spawn window + GL context when a swapchain is requested
-// and actually respect the swapchain configuration provided by the user.
 #[derive(Debug)]
 pub struct Surface {
-    context: Starc<glutin::WindowedContext<glutin::PossiblyCurrent>>,
+    window: Window,
 }
 
 impl Surface {
-    pub fn from_window(context: glutin::WindowedContext<glutin::PossiblyCurrent>) -> Self {
-        Surface {
-            context: Starc::new(context),
-        }
+    pub fn from_window(window: Window) -> Self {
+        Surface { window: Window }
     }
 
-    pub fn get_context(&self) -> &glutin::WindowedContext<glutin::PossiblyCurrent> {
-        &*self.context
+    pub fn get_window(&self) -> &Window {
+        &self.window
     }
 
-    pub fn context(&self) -> &glutin::WindowedContext<glutin::PossiblyCurrent> {
-        &self.context
+    pub fn window(&self) -> &Window {
+        &self.window
     }
 
     fn swapchain_formats(&self) -> Vec<f::Format> {
-        let pixel_format = self.context.get_pixel_format();
+        let pixel_format = self.window.get_pixel_format();
         let color_bits = pixel_format.color_bits;
         let alpha_bits = pixel_format.alpha_bits;
         let srgb = pixel_format.srgb;
@@ -124,8 +94,8 @@ impl Surface {
 
 impl hal::Surface<B> for Surface {
     fn kind(&self) -> hal::image::Kind {
-        let ex = get_window_extent(&self.context.window());
-        let samples = self.context.get_pixel_format().multisampling.unwrap_or(1);
+        let ex = get_window_extent(&self.window);
+        let samples = self.window.get_pixel_format().multisampling.unwrap_or(1);
         hal::image::Kind::D2(ex.width, ex.height, 1, samples as _)
     }
 
@@ -137,11 +107,11 @@ impl hal::Surface<B> for Surface {
         Option<Vec<f::Format>>,
         Vec<hal::PresentMode>,
     ) {
-        let ex = get_window_extent(&self.context.window());
+        let ex = get_window_extent(&self.window);
         let extent = hal::window::Extent2D::from(ex);
 
         let caps = hal::SurfaceCapabilities {
-            image_count: if self.context.get_pixel_format().double_buffer {
+            image_count: if self.window.get_pixel_format().double_buffer {
                 2..3
             } else {
                 1..2
@@ -168,6 +138,7 @@ impl hal::Surface<B> for Surface {
 }
 
 impl Device {
+    // TODO: Share most of this implementation with `glutin`
     pub(crate) fn create_swapchain_impl(
         &self,
         surface: &mut Surface,
@@ -175,14 +146,13 @@ impl Device {
     ) -> (Swapchain, Vec<native::Image>) {
         let swapchain = Swapchain {
             extent: config.extent,
-            context: surface.context.clone(),
+            window: surface.window.clone(),
         };
 
         let gl = &self.share.context;
 
         let (int_format, iformat, itype) = match config.format {
             f::Format::Rgba8Unorm => (glow::RGBA8, glow::RGBA, glow::UNSIGNED_BYTE),
-            f::Format::Bgra8Unorm => (glow::RGBA8, glow::BGRA, glow::UNSIGNED_BYTE),
             f::Format::Rgba8Srgb => (glow::SRGB8_ALPHA8, glow::RGBA, glow::UNSIGNED_BYTE),
             _ => unimplemented!(),
         };
@@ -288,48 +258,7 @@ impl Device {
 impl hal::Instance for Surface {
     type Backend = B;
     fn enumerate_adapters(&self) -> Vec<hal::Adapter<B>> {
-        let adapter = PhysicalDevice::new_adapter(GlContainer::from_fn_proc(|s| {
-            self.context.get_proc_address(s) as *const _
-        }));
-        vec![adapter]
-    }
-}
-
-pub fn config_context<C>(
-    builder: glutin::ContextBuilder<C>,
-    color_format: f::Format,
-    ds_format: Option<f::Format>,
-) -> glutin::ContextBuilder<C>
-where
-    C: glutin::ContextCurrentState,
-{
-    let color_base = color_format.base_format();
-    let color_bits = color_base.0.describe_bits();
-    let depth_bits = match ds_format {
-        Some(fm) => fm.base_format().0.describe_bits(),
-        None => f::BITS_ZERO,
-    };
-    builder
-        .with_depth_buffer(depth_bits.depth)
-        .with_stencil_buffer(depth_bits.stencil)
-        .with_pixel_format(color_bits.color, color_bits.alpha)
-        .with_srgb(color_base.1 == f::ChannelType::Srgb)
-}
-
-pub struct Headless(pub Starc<glutin::Context<glutin::PossiblyCurrent>>);
-
-impl Headless {
-    pub fn from_context(context: glutin::Context<glutin::PossiblyCurrent>) -> Headless {
-        Headless(Starc::new(context))
-    }
-}
-
-impl hal::Instance for Headless {
-    type Backend = B;
-    fn enumerate_adapters(&self) -> Vec<hal::Adapter<B>> {
-        let adapter = PhysicalDevice::new_adapter(GlContainer::from_fn_proc(|s| {
-            self.0.get_proc_address(s) as *const _
-        }));
+        let adapter = PhysicalDevice::new_adapter(GlContainer::from_new_canvas()); // TODO: Move to `self` like native/window
         vec![adapter]
     }
 }

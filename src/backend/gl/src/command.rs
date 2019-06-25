@@ -1,13 +1,13 @@
 #![allow(missing_docs)]
 
-use gl;
+use crate::GlContext;
 
-use hal::format::ChannelType;
-use hal::range::RangeArg;
-use hal::{self, buffer, command, image, memory, pass, pso, query, ColorSlot};
+use crate::hal::format::ChannelType;
+use crate::hal::range::RangeArg;
+use crate::hal::{self, buffer, command, image, memory, pass, pso, query, ColorSlot};
 
-use pool::{self, BufferMemory};
-use {native as n, Backend};
+use crate::pool::{self, BufferMemory};
+use crate::{native as n, Backend};
 
 use std::borrow::Borrow;
 use std::ops::Range;
@@ -53,22 +53,32 @@ impl BufferSlice {
 #[derive(Debug)]
 pub enum Command {
     Dispatch(hal::WorkGroupCount),
-    DispatchIndirect(gl::types::GLuint, buffer::Offset),
+    DispatchIndirect(n::RawBuffer, buffer::Offset),
     Draw {
-        primitive: gl::types::GLenum,
+        primitive: u32,
         vertices: Range<hal::VertexCount>,
         instances: Range<hal::InstanceCount>,
     },
     DrawIndexed {
-        primitive: gl::types::GLenum,
-        index_type: gl::types::GLenum,
+        primitive: u32,
+        index_type: u32,
         index_count: hal::IndexCount,
         index_buffer_offset: buffer::Offset,
         base_vertex: hal::VertexOffset,
         instances: Range<hal::InstanceCount>,
     },
-    BindIndexBuffer(gl::types::GLuint),
+    BindIndexBuffer(n::RawBuffer),
     //BindVertexBuffers(BufferSlice),
+    BindUniform {
+        uniform: n::UniformDesc,
+        buffer: BufferSlice,
+    },
+    BindRasterizer {
+        rasterizer: pso::Rasterizer,
+    },
+    BindDepth {
+        depth: pso::DepthTest,
+    },
     SetViewports {
         first_viewport: u32,
         viewport_ptr: BufferSlice,
@@ -92,63 +102,68 @@ pub enum Command {
     /// The buffer slice contains a list of `GLenum`.
     DrawBuffers(BufferSlice),
 
-    BindFrameBuffer(FrameBufferTarget, n::FrameBuffer),
+    BindFrameBuffer(FrameBufferTarget, Option<n::FrameBuffer>),
     BindTargetView(FrameBufferTarget, AttachmentPoint, n::ImageView),
     SetDrawColorBuffers(usize),
-    SetPatchSize(gl::types::GLint),
-    BindProgram(gl::types::GLuint),
-    BindBlendSlot(ColorSlot, pso::ColorBlendDesc),
-    BindAttribute(
-        n::AttributeDesc,
-        gl::types::GLuint,
-        gl::types::GLsizei,
-        gl::types::GLuint,
-    ),
+    SetPatchSize(i32),
+    BindProgram(<GlContext as glow::Context>::Program),
+    SetBlend(pso::ColorBlendDesc),
+    SetBlendSlot(ColorSlot, pso::ColorBlendDesc),
+    BindAttribute(n::AttributeDesc, n::RawBuffer, i32, u32),
     //UnbindAttribute(n::AttributeDesc),
     CopyBufferToBuffer(n::RawBuffer, n::RawBuffer, command::BufferCopy),
-    CopyBufferToTexture(n::RawBuffer, n::Texture, command::BufferImageCopy),
+    CopyBufferToTexture {
+        src_buffer: n::RawBuffer,
+        dst_texture: n::Texture,
+        texture_target: n::TextureTarget,
+        texture_format: n::TextureFormat,
+        pixel_type: n::DataType,
+        data: command::BufferImageCopy,
+    },
     CopyBufferToSurface(n::RawBuffer, n::Surface, command::BufferImageCopy),
-    CopyTextureToBuffer(n::Texture, n::RawBuffer, command::BufferImageCopy),
+    CopyTextureToBuffer {
+        src_texture: n::Texture,
+        texture_target: n::TextureTarget,
+        texture_format: n::TextureFormat,
+        pixel_type: n::DataType,
+        dst_buffer: n::RawBuffer,
+        data: command::BufferImageCopy,
+    },
     CopySurfaceToBuffer(n::Surface, n::RawBuffer, command::BufferImageCopy),
-    CopyImageToTexture(n::ImageKind, n::Texture, command::ImageCopy),
+    CopyImageToTexture(n::ImageKind, n::Texture, n::TextureTarget, command::ImageCopy),
     CopyImageToSurface(n::ImageKind, n::Surface, command::ImageCopy),
 
-    BindBufferRange(
-        gl::types::GLenum,
-        gl::types::GLuint,
-        n::RawBuffer,
-        gl::types::GLintptr,
-        gl::types::GLsizeiptr,
-    ),
-    BindTexture(gl::types::GLenum, n::Texture),
-    BindSampler(gl::types::GLuint, n::Texture),
-    SetTextureSamplerSettings(gl::types::GLuint, n::Texture, image::SamplerInfo),
+    BindBufferRange(u32, u32, n::RawBuffer, i32, i32),
+    BindTexture(u32, n::Texture, n::TextureTarget),
+    BindSampler(u32, n::Sampler),
+    SetTextureSamplerSettings(u32, n::Texture, n::TextureTarget, image::SamplerInfo),
 }
 
-pub type FrameBufferTarget = gl::types::GLenum;
-pub type AttachmentPoint = gl::types::GLenum;
-pub type DrawBuffer = gl::types::GLint;
+pub type FrameBufferTarget = u32;
+pub type AttachmentPoint = u32;
+pub type DrawBuffer = u32;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct AttachmentClear {
     subpass_id: Option<pass::SubpassId>,
     value: Option<command::ClearValueRaw>,
     stencil_value: Option<pso::StencilValue>,
 }
 
-#[derive(Clone)]
-struct RenderPassCache {
+#[derive(Debug)]
+pub struct RenderPassCache {
     render_pass: n::RenderPass,
-    framebuffer: n::FrameBuffer,
+    framebuffer: Option<n::FrameBuffer>,
     attachment_clears: Vec<AttachmentClear>,
 }
 
 // Cache current states of the command buffer
+#[derive(Debug)]
 struct Cache {
     // Active primitive topology, set by the current pipeline.
-    primitive: Option<gl::types::GLenum>,
-    // Active index type, set by the current index buffer.
-    index_type: Option<hal::IndexType>,
+    primitive: Option<u32>,
+    // Active index type and buffer range, set by the current index buffer.
+    index_type_range: Option<(hal::IndexType, Range<buffer::Offset>)>,
     // Stencil reference values (front, back).
     stencil_ref: Option<(pso::StencilValue, pso::StencilValue)>,
     // Blend color.
@@ -159,34 +174,37 @@ struct Cache {
     // Indicates that invalid commands have been recorded.
     error_state: bool,
     // Vertices per patch for tessellation primitives (patches).
-    patch_size: Option<gl::types::GLint>,
+    patch_size: Option<i32>,
     // Active program name.
-    program: Option<gl::types::GLuint>,
+    program: Option<n::Program>,
     // Blend per attachment.
-    blend_targets: Option<Vec<Option<pso::ColorBlendDesc>>>,
-    // Maps bound vertex buffer offset (index) to handle.
-    vertex_buffers: Vec<gl::types::GLuint>,
+    blend_targets: Vec<Option<pso::ColorBlendDesc>>,
+    // Maps bound vertex buffer offset (index) to handle / buffer range
+    vertex_buffers: Vec<Option<(n::RawBuffer, Range<buffer::Offset>)>>,
     // Active vertex buffer descriptions.
     vertex_buffer_descs: Vec<Option<pso::VertexBufferDesc>>,
     // Active attributes.
     attributes: Vec<n::AttributeDesc>,
+    // Active uniforms
+    uniforms: Vec<n::UniformDesc>,
 }
 
 impl Cache {
     pub fn new() -> Cache {
         Cache {
             primitive: None,
-            index_type: None,
+            index_type_range: None,
             stencil_ref: None,
             blend_color: None,
             framebuffer: None,
             error_state: false,
             patch_size: None,
             program: None,
-            blend_targets: None,
+            blend_targets: Vec::new(),
             vertex_buffers: Vec::new(),
             vertex_buffer_descs: Vec::new(),
             attributes: Vec::new(),
+            uniforms: Vec::new(),
         }
     }
 }
@@ -210,6 +228,7 @@ impl From<hal::Limits> for Limits {
 ///
 /// If you want to display your rendered results to a framebuffer created externally, see the
 /// `display_fb` field.
+#[derive(Debug)]
 pub struct RawCommandBuffer {
     pub(crate) memory: Arc<Mutex<BufferMemory>>,
     pub(crate) buf: BufferSlice,
@@ -228,7 +247,7 @@ pub struct RawCommandBuffer {
     ///
     /// This framebuffer must exist and be configured correctly (with renderbuffer attachments,
     /// etc.) so that rendering to it can occur immediately.
-    pub display_fb: n::FrameBuffer,
+    pub display_fb: Option<n::FrameBuffer>,
     cache: Cache,
 
     pass_cache: Option<RenderPassCache>,
@@ -270,7 +289,7 @@ impl RawCommandBuffer {
             id,
             individual_reset,
             fbo,
-            display_fb: 0 as n::FrameBuffer,
+            display_fb: None,
             cache: Cache::new(),
             pass_cache: None,
             cur_subpass: !0,
@@ -320,45 +339,48 @@ impl RawCommandBuffer {
         slice
     }
 
-    fn update_blend_targets(&mut self, blend_targets: &Vec<pso::ColorBlendDesc>) {
+    fn update_blend_targets(&mut self, blend_targets: &[pso::ColorBlendDesc]) {
         let max_blend_slots = blend_targets.len();
-
-        if max_blend_slots > 0 {
-            match self.cache.blend_targets {
-                Some(ref mut cached) => {
-                    if cached.len() < max_blend_slots {
-                        cached.resize(max_blend_slots, None);
-                    }
-                }
-                None => {
-                    self.cache.blend_targets = Some(vec![None; max_blend_slots]);
-                }
-            };
+        if max_blend_slots == 0 {
+            return;
         }
 
-        for (slot, blend_target) in blend_targets.iter().enumerate() {
-            let mut update_blend = false;
-            if let Some(ref mut cached_targets) = self.cache.blend_targets {
-                if let Some(cached_target) = cached_targets.get(slot) {
-                    match cached_target {
-                        &Some(ref cache) => {
-                            if cache != blend_target {
-                                update_blend = true;
-                            }
-                        }
-                        &None => {
-                            update_blend = true;
-                        }
-                    }
-                }
+        if self.cache.blend_targets.len() < max_blend_slots {
+            self.cache.blend_targets.resize(max_blend_slots, None);
+        }
 
-                if update_blend {
-                    cached_targets[slot] = Some(*blend_target);
+        let all_targets_same = blend_targets[1..].iter().all(|target| target == &blend_targets[0]);
+
+        if all_targets_same {
+            let mut update_blend = false;
+            for cached_target in &mut self.cache.blend_targets {
+                if cached_target.as_ref() != Some(&blend_targets[0]) {
+                    *cached_target = Some(blend_targets[0]);
+                    update_blend = true;
                 }
             }
-
             if update_blend {
-                self.push_cmd(Command::BindBlendSlot(slot as _, *blend_target));
+                self.push_cmd(Command::SetBlend(blend_targets[0]));
+            }
+        } else {
+            for (slot, (blend_target, cached_target)) in blend_targets
+                .iter()
+                .zip(&mut self.cache.blend_targets)
+                .enumerate() {
+                let update_blend = match cached_target {
+                    Some(cache) => cache != blend_target,
+                    None => true,
+                };
+
+                if update_blend {
+                    *cached_target = Some(*blend_target);
+                    push_cmd_internal(
+                        &self.id,
+                        &mut self.memory,
+                        &mut self.buf,
+                        Command::SetBlendSlot(slot as _, *blend_target)
+                    );
+                }
             }
         }
     }
@@ -378,7 +400,10 @@ impl RawCommandBuffer {
                 error!("No vertex buffer bound at {}", binding);
             }
 
-            let handle = vertex_buffers[binding];
+            let (handle, range) = vertex_buffers[binding].as_ref().unwrap();
+
+            let mut attribute = attribute.clone();
+            attribute.offset += range.start as u32;
 
             match vertex_buffer_descs.get(binding) {
                 Some(&Some(desc)) => {
@@ -387,10 +412,10 @@ impl RawCommandBuffer {
                         &mut self.memory,
                         &mut self.buf,
                         Command::BindAttribute(
-                            attribute.clone(),
-                            handle,
+                            attribute,
+                            *handle,
                             desc.stride as _,
-                            desc.rate as u32,
+                            desc.rate.as_uint() as u32,
                         ),
                     );
                 }
@@ -409,17 +434,17 @@ impl RawCommandBuffer {
 
             // Bind draw buffers for mapping color output locations with
             // framebuffer attachments.
-            let draw_buffers = if state.framebuffer == n::DEFAULT_FRAMEBUFFER {
+            let draw_buffers = if state.framebuffer.is_none() {
                 // The default framebuffer is created by the driver
                 // We don't have influence on its layout and we treat it as single image.
                 //
-                // TODO: handle case where we don't du double-buffering?
-                vec![gl::BACK_LEFT]
+                // TODO: handle case where we don't do double-buffering?
+                vec![glow::BACK_LEFT]
             } else {
                 subpass
                     .color_attachments
                     .iter()
-                    .map(|id| gl::COLOR_ATTACHMENT0 + *id as gl::types::GLenum)
+                    .map(|id| glow::COLOR_ATTACHMENT0 + *id as u32)
                     .collect::<Vec<_>>()
             };
 
@@ -446,41 +471,41 @@ impl RawCommandBuffer {
 
                             let cmd = match channel {
                                 ChannelType::Unorm
-                                | ChannelType::Inorm
+                                | ChannelType::Snorm
                                 | ChannelType::Ufloat
-                                | ChannelType::Float
+                                | ChannelType::Sfloat
                                 | ChannelType::Srgb
                                 | ChannelType::Uscaled
-                                | ChannelType::Iscaled => {
+                                | ChannelType::Sscaled => {
                                     Command::ClearBufferColorF(0, unsafe { cv.color.float32 })
                                 }
                                 ChannelType::Uint => {
                                     Command::ClearBufferColorU(0, unsafe { cv.color.uint32 })
                                 }
-                                ChannelType::Int => {
+                                ChannelType::Sint => {
                                     Command::ClearBufferColorI(0, unsafe { cv.color.int32 })
                                 }
                             };
 
                             return Some(cmd);
                         }
+                    }
+
+                    // Clear depth-stencil target
+                    let depth = if view_format.is_depth() {
+                        clear.value.map(|cv| unsafe { cv.depth_stencil.depth })
                     } else {
-                        // Clear depth-stencil target
-                        let depth = if view_format.is_depth() {
-                            clear.value.map(|cv| unsafe { cv.depth_stencil.depth })
-                        } else {
-                            None
-                        };
+                        None
+                    };
 
-                        let stencil = if view_format.is_stencil() {
-                            clear.stencil_value
-                        } else {
-                            None
-                        };
+                    let stencil = if view_format.is_stencil() {
+                        clear.stencil_value
+                    } else {
+                        None
+                    };
 
-                        if depth.is_some() || stencil.is_some() {
-                            return Some(Command::ClearBufferDepthStencil(depth, stencil));
-                        }
+                    if depth.is_some() || stencil.is_some() {
+                        return Some(Command::ClearBufferDepthStencil(depth, stencil));
                     }
 
                     None
@@ -572,7 +597,7 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
     unsafe fn begin_render_pass<T>(
         &mut self,
         render_pass: &n::RenderPass,
-        framebuffer: &n::FrameBuffer,
+        framebuffer: &Option<n::FrameBuffer>,
         _render_area: pso::Rect,
         clear_values: T,
         _first_subpass: command::SubpassContents,
@@ -595,7 +620,10 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         //  >= GL 4.5: Invalidate framebuffer attachment when store op is `DONT_CARE`.
 
         // 2./3.
-        self.push_cmd(Command::BindFrameBuffer(gl::DRAW_FRAMEBUFFER, *framebuffer));
+        self.push_cmd(Command::BindFrameBuffer(
+            glow::DRAW_FRAMEBUFFER,
+            *framebuffer,
+        ));
 
         let mut clear_values_iter = clear_values.into_iter();
         let attachment_clears = render_pass
@@ -665,38 +693,40 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
                 // 2. ClearBuffer
                 let view = match image.kind {
                     n::ImageKind::Surface(id) => n::ImageView::Surface(id),
-                    n::ImageKind::Texture(id) => n::ImageView::Texture(id, 0), //TODO
+                    n::ImageKind::Texture { texture, target, .. } => {
+                        n::ImageView::Texture(texture, target, 0) //TODO
+                    }
                 };
-                self.push_cmd(Command::BindFrameBuffer(gl::DRAW_FRAMEBUFFER, fbo));
+                self.push_cmd(Command::BindFrameBuffer(glow::DRAW_FRAMEBUFFER, Some(fbo)));
                 self.push_cmd(Command::BindTargetView(
-                    gl::DRAW_FRAMEBUFFER,
-                    gl::COLOR_ATTACHMENT0,
+                    glow::DRAW_FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
                     view,
                 ));
                 self.push_cmd(Command::SetDrawColorBuffers(1));
 
                 match image.channel {
                     ChannelType::Unorm
-                    | ChannelType::Inorm
+                    | ChannelType::Snorm
                     | ChannelType::Ufloat
-                    | ChannelType::Float
+                    | ChannelType::Sfloat
                     | ChannelType::Srgb
                     | ChannelType::Uscaled
-                    | ChannelType::Iscaled => {
+                    | ChannelType::Sscaled => {
                         self.push_cmd(Command::ClearBufferColorF(0, color.float32))
                     }
                     ChannelType::Uint => self.push_cmd(Command::ClearBufferColorU(0, color.uint32)),
-                    ChannelType::Int => self.push_cmd(Command::ClearBufferColorI(0, color.int32)),
+                    ChannelType::Sint => self.push_cmd(Command::ClearBufferColorI(0, color.int32)),
                 }
             }
             None => {
                 // 1. glClear
-                let text = match image.kind {
-                    n::ImageKind::Texture(id) => id, //TODO
+                let (tex, target) = match image.kind {
+                    n::ImageKind::Texture { texture, target, .. } => (texture, target), //TODO
                     n::ImageKind::Surface(_id) => unimplemented!(),
                 };
 
-                self.push_cmd(Command::BindTexture(0, text));
+                self.push_cmd(Command::BindTexture(0, tex, target));
                 self.push_cmd(Command::ClearTexture(color.float32));
             }
         }
@@ -742,16 +772,13 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
     }
 
     unsafe fn bind_index_buffer(&mut self, ibv: buffer::IndexBufferView<Backend>) {
-        // TODO: how can we incorporate the buffer offset?
-        if ibv.offset > 0 {
-            warn!("Non-zero index buffer offset currently not handled.");
-        }
+        let (raw_buffer, range) = ibv.buffer.as_bound();
 
-        self.cache.index_type = Some(ibv.index_type);
-        self.push_cmd(Command::BindIndexBuffer(ibv.buffer.raw));
+        self.cache.index_type_range = Some((ibv.index_type, range.start + ibv.offset..range.end));
+        self.push_cmd(Command::BindIndexBuffer(raw_buffer));
     }
 
-    unsafe fn bind_vertex_buffers<I, T>(&mut self, first_binding: u32, buffers: I)
+    unsafe fn bind_vertex_buffers<I, T>(&mut self, first_binding: pso::BufferIndex, buffers: I)
     where
         I: IntoIterator<Item = (T, buffer::Offset)>,
         T: Borrow<n::Buffer>,
@@ -759,12 +786,11 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         for (i, (buffer, offset)) in buffers.into_iter().enumerate() {
             let index = first_binding as usize + i;
             if self.cache.vertex_buffers.len() <= index {
-                self.cache.vertex_buffers.resize(index + 1, 0);
+                self.cache.vertex_buffers.resize(index + 1, None);
             }
-            self.cache.vertex_buffers[index] = buffer.borrow().raw;
-            if offset != 0 {
-                error!("Vertex buffer offset {} is not supported", offset);
-            }
+
+            let (raw_buffer, range) = buffer.borrow().as_bound();
+            self.cache.vertex_buffers[index] = Some((raw_buffer, range.start + offset..range.end));
         }
     }
 
@@ -909,6 +935,9 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
             ref blend_targets,
             ref attributes,
             ref vertex_buffers,
+            ref uniforms,
+            rasterizer,
+            depth,
         } = *pipeline;
 
         if self.cache.primitive != Some(primitive) {
@@ -931,7 +960,16 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
 
         self.cache.vertex_buffer_descs = vertex_buffers.clone();
 
+        self.cache.uniforms = uniforms.clone();
+
         self.update_blend_targets(blend_targets);
+
+        self.push_cmd(Command::BindRasterizer { 
+            rasterizer, 
+        });
+        self.push_cmd(Command::BindDepth { 
+            depth,
+        });
     }
 
     unsafe fn bind_graphics_descriptor_sets<I, J>(
@@ -950,7 +988,6 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
 
         let mut set = first_set as _;
         let drd = &*layout.desc_remap_data.read().unwrap();
-
         for desc_set in sets {
             let desc_set = desc_set.borrow();
             let bindings = desc_set.bindings.lock().unwrap();
@@ -964,7 +1001,7 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
                         size,
                     } => {
                         let btype = match btype {
-                            n::BindingTypes::UniformBuffers => gl::UNIFORM_BUFFER,
+                            n::BindingTypes::UniformBuffers => glow::UNIFORM_BUFFER,
                             n::BindingTypes::Images => panic!("Wrong desc set binding"),
                         };
                         for binding in drd
@@ -972,16 +1009,20 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
                             .unwrap()
                         {
                             self.push_cmd(Command::BindBufferRange(
-                                btype, *binding, *buffer, *offset, *size,
+                                btype,
+                                *binding,
+                                *buffer,
+                                *offset as i32,
+                                *size as i32,
                             ))
                         }
                     }
-                    n::DescSetBindings::Texture(binding, texture) => {
+                    n::DescSetBindings::Texture(binding, texture, textype) => {
                         for binding in drd
                             .get_binding(n::BindingTypes::Images, set, *binding)
                             .unwrap()
                         {
-                            self.push_cmd(Command::BindTexture(*binding, *texture))
+                            self.push_cmd(Command::BindTexture(*binding, *texture, *textype))
                         }
                     }
                     n::DescSetBindings::Sampler(binding, sampler) => {
@@ -999,11 +1040,11 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
                             .into_iter()
                             .flat_map(|binding| {
                                 bindings.iter().filter_map(move |b| {
-                                    if let n::DescSetBindings::Texture(b, t) = b {
+                                    if let n::DescSetBindings::Texture(b, t, ttype) = b {
                                         let nbs =
                                             drd.get_binding(n::BindingTypes::Images, set, *b)?;
                                         if nbs.contains(binding) {
-                                            Some((*binding, *t))
+                                            Some((*binding, *t, *ttype))
                                         } else {
                                             None
                                         }
@@ -1018,20 +1059,21 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
                         // textures as in `all_txts` unless all the bindings of that
                         // texture are gonna be unbound or the two samplers have
                         // identical properties.
-
                         all_txts.sort_unstable_by(|a, b| a.1.cmp(&b.1));
                         all_txts.dedup_by(|a, b| a.1 == b.1);
 
-                        for (binding, txt) in all_txts {
+                        for (binding, txt, textype) in all_txts {
                             self.push_cmd(Command::SetTextureSamplerSettings(
                                 binding,
                                 txt,
+                                textype,
                                 sinfo.clone(),
                             ))
                         }
                     }
                 }
             }
+
             set += 1;
         }
     }
@@ -1065,7 +1107,8 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
     }
 
     unsafe fn dispatch_indirect(&mut self, buffer: &n::Buffer, offset: buffer::Offset) {
-        self.push_cmd(Command::DispatchIndirect(buffer.raw, offset));
+        let (raw_buffer, range) = buffer.borrow().as_bound();
+        self.push_cmd(Command::DispatchIndirect(raw_buffer, range.start + offset));
     }
 
     unsafe fn copy_buffer<T>(&mut self, src: &n::Buffer, dst: &n::Buffer, regions: T)
@@ -1073,15 +1116,19 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         T: IntoIterator,
         T::Item: Borrow<command::BufferCopy>,
     {
-        let old_offset = self.buf.offset;
+        let old_size = self.buf.size;
 
+        let (src_raw, src_range) = src.as_bound();
+        let (dst_raw, dst_range) = dst.as_bound();
         for region in regions {
-            let r = region.borrow().clone();
-            let cmd = Command::CopyBufferToBuffer(src.raw, dst.raw, r);
+            let mut r = region.borrow().clone();
+            r.src += src_range.start;
+            r.dst += dst_range.start;
+            let cmd = Command::CopyBufferToBuffer(src_raw, dst_raw, r);
             self.push_cmd(cmd);
         }
 
-        if self.buf.offset == old_offset {
+        if self.buf.size == old_size {
             error!("At least one region must be specified");
         }
     }
@@ -1097,18 +1144,20 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         T: IntoIterator,
         T::Item: Borrow<command::ImageCopy>,
     {
-        let old_offset = self.buf.offset;
+        let old_size = self.buf.size;
 
         for region in regions {
             let r = region.borrow().clone();
             let cmd = match dst.kind {
                 n::ImageKind::Surface(s) => Command::CopyImageToSurface(src.kind, s, r),
-                n::ImageKind::Texture(t) => Command::CopyImageToTexture(src.kind, t, r),
+                n::ImageKind::Texture { texture, target, .. } => {
+                    Command::CopyImageToTexture(src.kind, texture, target, r)
+                },
             };
             self.push_cmd(cmd);
         }
 
-        if self.buf.offset == old_offset {
+        if self.buf.size == old_size {
             error!("At least one region must be specified");
         }
     }
@@ -1125,11 +1174,22 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
     {
         let old_size = self.buf.size;
 
+        let (src_raw, src_range) = src.as_bound();
         for region in regions {
-            let r = region.borrow().clone();
+            let mut r = region.borrow().clone();
+            r.buffer_offset += src_range.start;
             let cmd = match dst.kind {
-                n::ImageKind::Surface(s) => Command::CopyBufferToSurface(src.raw, s, r),
-                n::ImageKind::Texture(t) => Command::CopyBufferToTexture(src.raw, t, r),
+                n::ImageKind::Surface(s) => Command::CopyBufferToSurface(src_raw, s, r),
+                n::ImageKind::Texture { texture, target, format, pixel_type } => {
+                    Command::CopyBufferToTexture {
+                        src_buffer: src_raw,
+                        dst_texture: texture,
+                        texture_target: target,
+                        texture_format: format,
+                        pixel_type,
+                        data: r,
+                    }
+                },
             };
             self.push_cmd(cmd);
         }
@@ -1150,12 +1210,23 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         T::Item: Borrow<command::BufferImageCopy>,
     {
         let old_size = self.buf.size;
+        let (dst_raw, dst_range) = dst.as_bound();
 
         for region in regions {
-            let r = region.borrow().clone();
+            let mut r = region.borrow().clone();
+            r.buffer_offset += dst_range.start;
             let cmd = match src.kind {
-                n::ImageKind::Surface(s) => Command::CopySurfaceToBuffer(s, dst.raw, r),
-                n::ImageKind::Texture(t) => Command::CopyTextureToBuffer(t, dst.raw, r),
+                n::ImageKind::Surface(s) => Command::CopySurfaceToBuffer(s, dst_raw, r),
+                n::ImageKind::Texture { texture, target, format, pixel_type } => {
+                    Command::CopyTextureToBuffer {
+                        src_texture: texture,
+                        texture_target: target,
+                        texture_format: format,
+                        pixel_type: pixel_type,
+                        dst_buffer: dst_raw,
+                        data: r,
+                    }
+                },
             };
             self.push_cmd(cmd);
         }
@@ -1195,22 +1266,27 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
     ) {
         self.bind_attributes();
 
-        let (start, index_type) = match self.cache.index_type {
-            Some(hal::IndexType::U16) => (indices.start * 2, gl::UNSIGNED_SHORT),
-            Some(hal::IndexType::U32) => (indices.start * 4, gl::UNSIGNED_INT),
+        let (index_type, buffer_range) = match &self.cache.index_type_range {
+            Some((index_type, buffer_range)) => (index_type, buffer_range),
             None => {
                 warn!("No index type bound. An index buffer needs to be bound before calling `draw_indexed`.");
                 self.cache.error_state = true;
                 return;
             }
         };
+
+        let (start, index_type) = match index_type {
+            hal::IndexType::U16 => (indices.start as buffer::Offset * 2 + buffer_range.start, glow::UNSIGNED_SHORT),
+            hal::IndexType::U32 => (indices.start as buffer::Offset * 4 + buffer_range.start, glow::UNSIGNED_INT),
+        };
+
         match self.cache.primitive {
             Some(primitive) => {
                 self.push_cmd(Command::DrawIndexed {
                     primitive,
                     index_type,
                     index_count: indices.end - indices.start,
-                    index_buffer_offset: start as _,
+                    index_buffer_offset: start,
                     base_vertex,
                     instances,
                 });
@@ -1239,6 +1315,28 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         _draw_count: hal::DrawCount,
         _stride: u32,
     ) {
+        unimplemented!()
+    }
+
+    unsafe fn set_event(&mut self, _: &(), _: pso::PipelineStage) {
+        unimplemented!()
+    }
+
+    unsafe fn reset_event(&mut self, _: &(), _: pso::PipelineStage) {
+        unimplemented!()
+    }
+
+    unsafe fn wait_events<'a, I, J>(
+        &mut self,
+        _: I,
+        _: Range<pso::PipelineStage>,
+        _: J
+    ) where
+        I: IntoIterator,
+    I::Item: Borrow<()>,
+    J: IntoIterator,
+    J::Item: Borrow<memory::Barrier<'a, Backend>>,
+    {
         unimplemented!()
     }
 
@@ -1274,10 +1372,29 @@ impl command::RawCommandBuffer<Backend> for RawCommandBuffer {
         &mut self,
         _layout: &n::PipelineLayout,
         _stages: pso::ShaderStageFlags,
-        _offset: u32,
-        _constants: &[u32],
+        offset: u32,
+        constants: &[u32],
     ) {
-        unimplemented!()
+        let buffer = self.add(constants);
+
+        let uniforms = &self.cache.uniforms;
+        if uniforms.is_empty() {
+            unimplemented!()
+        }
+
+        let uniform = if offset == 0 {
+            // If offset is zero, we can just return the first item
+            // in our uniform list
+            uniforms.get(0).unwrap()
+        } else {
+            match uniforms.binary_search_by(|uniform| uniform.offset.cmp(&offset as _)) {
+                Ok(index) => uniforms.get(index).unwrap(),
+                Err(_) => panic!("No uniform found at offset: {}", offset),
+            }
+        }
+        .clone();
+
+        self.push_cmd(Command::BindUniform { uniform, buffer });
     }
 
     unsafe fn push_compute_constants(

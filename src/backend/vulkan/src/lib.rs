@@ -5,6 +5,8 @@ extern crate log;
 #[macro_use]
 extern crate ash;
 extern crate byteorder;
+#[macro_use]
+extern crate derivative;
 extern crate gfx_hal as hal;
 #[macro_use]
 extern crate lazy_static;
@@ -12,28 +14,39 @@ extern crate lazy_static;
 extern crate shared_library;
 extern crate smallvec;
 
+#[cfg(target_os = "macos")]
+extern crate core_graphics;
+#[cfg(target_os = "macos")]
+#[macro_use]
+extern crate objc;
+
 #[cfg(windows)]
 extern crate winapi;
 #[cfg(feature = "winit")]
 extern crate winit;
-#[cfg(all(unix, not(target_os = "android")))]
+#[cfg(all(feature = "x11", unix, not(target_os = "android"), not(target_os = "macos")))]
 extern crate x11;
-#[cfg(all(unix, not(target_os = "android")))]
+#[cfg(all(feature = "xcb", unix, not(target_os = "android"), not(target_os = "macos")))]
 extern crate xcb;
 
-use ash::extensions::{ext, khr};
+
+use ash::extensions::{self, ext::DebugUtils};
 use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
 use ash::vk;
 #[cfg(not(feature = "use-rtld-next"))]
 use ash::{Entry, LoadingError};
 
-use hal::adapter::DeviceType;
-use hal::error::{DeviceCreationError, HostExecutionError};
-use hal::pso::PipelineStage;
-use hal::{format, image, memory, queue};
-use hal::{Features, Limits, PatchSize, QueueType, SwapImageIndex};
+use crate::hal::adapter::DeviceType;
+use crate::hal::device::{DeviceLost, OutOfMemory, SurfaceLost};
+use crate::hal::error::{DeviceCreationError, HostExecutionError};
+use crate::hal::pso::PipelineStage;
+use crate::hal::{
+    format, image, memory, queue,
+    window::{PresentError, Suboptimal},
+};
+use crate::hal::{Features, Limits, PatchSize, QueueType, SwapImageIndex};
 
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 use std::{fmt, mem, ptr, slice};
@@ -54,17 +67,36 @@ mod window;
 
 // CStr's cannot be constant yet, until const fn lands we need to use a lazy_static
 lazy_static! {
-    static ref LAYERS: Vec<&'static CStr> = vec![#[cfg(debug_assertions)] CStr::from_bytes_with_nul(b"VK_LAYER_LUNARG_standard_validation\0").expect("Wrong extension string")];
-    static ref EXTENSIONS: Vec<&'static CStr> = vec![#[cfg(debug_assertions)] CStr::from_bytes_with_nul(b"VK_EXT_debug_utils\0").expect("Wrong extension string")];
-    static ref DEVICE_EXTENSIONS: Vec<&'static CStr> = vec![khr::Swapchain::name()];
+    static ref LAYERS: Vec<&'static CStr> = if cfg!(all(target_os = "android", debug_assertions)) {
+        vec![
+            CStr::from_bytes_with_nul(b"VK_LAYER_LUNARG_core_validation\0").unwrap(),
+            CStr::from_bytes_with_nul(b"VK_LAYER_LUNARG_object_tracker\0").unwrap(),
+            CStr::from_bytes_with_nul(b"VK_LAYER_LUNARG_parameter_validation\0").unwrap(),
+            CStr::from_bytes_with_nul(b"VK_LAYER_GOOGLE_threading\0").unwrap(),
+            CStr::from_bytes_with_nul(b"VK_LAYER_GOOGLE_unique_objects\0").unwrap(),
+        ]
+    } else if cfg!(debug_assertions) {
+        vec![CStr::from_bytes_with_nul(b"VK_LAYER_LUNARG_standard_validation\0").unwrap()]
+    } else {
+        vec![]
+    };
+    static ref EXTENSIONS: Vec<&'static CStr> = vec![#[cfg(debug_assertions)] CStr::from_bytes_with_nul(b"VK_EXT_debug_utils\0").unwrap()];
+    static ref DEVICE_EXTENSIONS: Vec<&'static CStr> = vec![extensions::khr::Swapchain::name()];
     static ref SURFACE_EXTENSIONS: Vec<&'static CStr> = vec![
-        khr::Surface::name(),
+        extensions::khr::Surface::name(),
         // Platform-specific WSI extensions
-        khr::XlibSurface::name(),
-        khr::XcbSurface::name(),
-        khr::WaylandSurface::name(),
-        khr::AndroidSurface::name(),
-        khr::Win32Surface::name(),
+        #[cfg(all(unix, not(target_os = "android"), not(target_os = "macos")))]
+        extensions::khr::XlibSurface::name(),
+        #[cfg(all(unix, not(target_os = "android"), not(target_os = "macos")))]
+        extensions::khr::XcbSurface::name(),
+        #[cfg(all(unix, not(target_os = "android"), not(target_os = "macos")))]
+        extensions::khr::WaylandSurface::name(),
+        #[cfg(target_os = "android")]
+        extensions::khr::AndroidSurface::name(),
+        #[cfg(target_os = "windows")]
+        extensions::khr::Win32Surface::name(),
+        #[cfg(target_os = "macos")]
+        extensions::mvk::MacOSSurface::name(),
     ];
 }
 
@@ -89,8 +121,9 @@ lazy_static! {
 
 pub struct RawInstance(
     pub ash::Instance,
-    Option<(ext::DebugUtils, vk::DebugUtilsMessengerEXT)>,
+    Option<(DebugUtils, vk::DebugUtilsMessengerEXT)>,
 );
+
 impl Drop for RawInstance {
     fn drop(&mut self) {
         unsafe {
@@ -106,7 +139,10 @@ impl Drop for RawInstance {
     }
 }
 
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct Instance {
+    #[derivative(Debug = "ignore")]
     pub raw: Arc<RawInstance>,
 
     /// Supported extensions of this instance.
@@ -173,13 +209,13 @@ unsafe fn display_debug_utils_object_name_info_ext(
 
                 match object_name {
                     Some(name) => format!(
-                        "(type: {}, hndl: {}, name: {})",
+                        "(type: {:?}, hndl: {}, name: {})",
                         obj_info.object_type,
                         &obj_info.object_handle.to_string(),
                         name
                     ),
                     None => format!(
-                        "(type: {}, hndl: {})",
+                        "(type: {:?}, hndl: {})",
                         obj_info.object_type,
                         &obj_info.object_handle.to_string()
                     ),
@@ -205,31 +241,40 @@ unsafe extern "system" fn debug_utils_messenger_callback(
         vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE => log::Level::Trace,
         _ => log::Level::Warn,
     };
-    let message_type = &format!("{}", message_type);
-
-    let message_id_name = CStr::from_ptr(callback_data.p_message_id_name).to_string_lossy();
+    let message_type = &format!("{:?}", message_type);
     let message_id_number: i32 = callback_data.message_id_number as i32;
-    let message = CStr::from_ptr(callback_data.p_message).to_string_lossy();
+
+    let message_id_name = if callback_data.p_message_id_name.is_null() {
+        Cow::from("")
+    } else {
+        CStr::from_ptr(callback_data.p_message_id_name).to_string_lossy()
+    };
+
+    let message = if callback_data.p_message.is_null() {
+        Cow::from("")
+    } else {
+        CStr::from_ptr(callback_data.p_message).to_string_lossy()
+    };
 
     let additional_info: [(&str, Option<String>); 3] = [
         (
             "queue info",
             display_debug_utils_label_ext(
-                callback_data.p_queue_labels,
+                callback_data.p_queue_labels as *mut _,
                 callback_data.queue_label_count as usize,
             ),
         ),
         (
             "cmd buf info",
             display_debug_utils_label_ext(
-                callback_data.p_cmd_buf_labels,
+                callback_data.p_cmd_buf_labels as *mut _,
                 callback_data.cmd_buf_label_count as usize,
             ),
         ),
         (
             "object info",
             display_debug_utils_object_name_info_ext(
-                callback_data.p_objects,
+                callback_data.p_objects as *mut _,
                 callback_data.object_count as usize,
             ),
         ),
@@ -348,18 +393,25 @@ impl Instance {
 
         #[cfg(debug_assertions)]
         let debug_messenger = {
-            let ext = ext::DebugUtils::new(entry, &instance);
-            let info = vk::DebugUtilsMessengerCreateInfoEXT {
-                s_type: vk::StructureType::DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
-                p_next: ptr::null(),
-                flags: vk::DebugUtilsMessengerCreateFlagsEXT::empty(),
-                message_severity: vk::DebugUtilsMessageSeverityFlagsEXT::all(),
-                message_type: vk::DebugUtilsMessageTypeFlagsEXT::all(),
-                pfn_user_callback: Some(debug_utils_messenger_callback),
-                p_user_data: ptr::null_mut(),
-            };
-            let handle = unsafe { ext.create_debug_utils_messenger(&info, None) }.unwrap();
-            Some((ext, handle))
+            // make sure VK_EXT_debug_utils is available
+            if instance_extensions.iter().any(|props| unsafe {
+                CStr::from_ptr(props.extension_name.as_ptr()) == DebugUtils::name()
+            }) {
+                let ext = DebugUtils::new(entry, &instance);
+                let info = vk::DebugUtilsMessengerCreateInfoEXT {
+                    s_type: vk::StructureType::DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+                    p_next: ptr::null(),
+                    flags: vk::DebugUtilsMessengerCreateFlagsEXT::empty(),
+                    message_severity: vk::DebugUtilsMessageSeverityFlagsEXT::all(),
+                    message_type: vk::DebugUtilsMessageTypeFlagsEXT::all(),
+                    pfn_user_callback: Some(debug_utils_messenger_callback),
+                    p_user_data: ptr::null_mut(),
+                };
+                let handle = unsafe { ext.create_debug_utils_messenger(&info, None) }.unwrap();
+                Some((ext, handle))
+            } else {
+                None
+            }
         };
         #[cfg(not(debug_assertions))]
         let debug_messenger = None;
@@ -448,7 +500,10 @@ impl hal::queue::QueueFamily for QueueFamily {
     }
 }
 
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct PhysicalDevice {
+    #[derivative(Debug = "ignore")]
     instance: Arc<RawInstance>,
     handle: vk::PhysicalDevice,
     properties: vk::PhysicalDeviceProperties,
@@ -615,7 +670,7 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
         let memory_types = mem_properties.memory_types[..mem_properties.memory_type_count as usize]
             .iter()
             .map(|mem| {
-                use memory::Properties;
+                use crate::memory::Properties;
                 let mut type_flags = Properties::empty();
 
                 if mem
@@ -623,6 +678,12 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
                     .intersects(vk::MemoryPropertyFlags::DEVICE_LOCAL)
                 {
                     type_flags |= Properties::DEVICE_LOCAL;
+                }
+                if mem
+                  .property_flags
+                  .intersects(vk::MemoryPropertyFlags::HOST_VISIBLE)
+                {
+                    type_flags |= Properties::CPU_VISIBLE;
                 }
                 if mem
                     .property_flags
@@ -635,12 +696,6 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
                     .intersects(vk::MemoryPropertyFlags::HOST_CACHED)
                 {
                     type_flags |= Properties::CPU_CACHED;
-                }
-                if mem
-                    .property_flags
-                    .intersects(vk::MemoryPropertyFlags::HOST_VISIBLE)
-                {
-                    type_flags |= Properties::CPU_VISIBLE;
                 }
                 if mem
                     .property_flags
@@ -715,6 +770,9 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
         if features.depth_bias_clamp != 0 {
             bits |= Features::DEPTH_BIAS_CLAMP;
         }
+        if features.fill_mode_non_solid != 0 {
+            bits |= Features::NON_FILL_POLYGON_MODE;
+        }
         if features.depth_bounds != 0 {
             bits |= Features::DEPTH_BOUNDS;
         }
@@ -765,16 +823,26 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
         let max_group_size = limits.max_compute_work_group_size;
 
         Limits {
-            max_texture_size: limits.max_image_dimension3_d as _,
+            max_image_1d_size: limits.max_image_dimension1_d,
+            max_image_2d_size: limits.max_image_dimension2_d,
+            max_image_3d_size: limits.max_image_dimension3_d,
+            max_image_cube_size: limits.max_image_dimension_cube,
+            max_image_array_layers: limits.max_image_array_layers as _,
             max_texel_elements: limits.max_texel_buffer_elements as _,
             max_patch_size: limits.max_tessellation_patch_size as PatchSize,
             max_viewports: limits.max_viewports as _,
-            max_compute_group_count: [
+            max_viewport_dimensions: limits.max_viewport_dimensions,
+            max_framebuffer_extent: image::Extent {
+                width: limits.max_framebuffer_width,
+                height: limits.max_framebuffer_height,
+                depth: limits.max_framebuffer_layers,
+            },
+            max_compute_work_group_count: [
                 max_group_count[0] as _,
                 max_group_count[1] as _,
                 max_group_count[2] as _,
             ],
-            max_compute_group_size: [
+            max_compute_work_group_size: [
                 max_group_size[0] as _,
                 max_group_size[1] as _,
                 max_group_size[2] as _,
@@ -784,8 +852,8 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
             max_vertex_input_attribute_offset: limits.max_vertex_input_attribute_offset as _,
             max_vertex_input_binding_stride: limits.max_vertex_input_binding_stride as _,
             max_vertex_output_components: limits.max_vertex_output_components as _,
-            min_buffer_copy_offset_alignment: limits.optimal_buffer_copy_offset_alignment as _,
-            min_buffer_copy_pitch_alignment: limits.optimal_buffer_copy_row_pitch_alignment as _,
+            optimal_buffer_copy_offset_alignment: limits.optimal_buffer_copy_offset_alignment as _,
+            optimal_buffer_copy_pitch_alignment: limits.optimal_buffer_copy_row_pitch_alignment as _,
             min_texel_buffer_offset_alignment: limits.min_texel_buffer_offset_alignment as _,
             min_uniform_buffer_offset_alignment: limits.min_uniform_buffer_offset_alignment as _,
             min_storage_buffer_offset_alignment: limits.min_storage_buffer_offset_alignment as _,
@@ -794,42 +862,53 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
             framebuffer_stencil_samples_count: limits.framebuffer_stencil_sample_counts.as_raw()
                 as _,
             max_color_attachments: limits.max_color_attachments as _,
+            buffer_image_granularity: limits.buffer_image_granularity,
             non_coherent_atom_size: limits.non_coherent_atom_size as _,
             max_sampler_anisotropy: limits.max_sampler_anisotropy,
             min_vertex_input_binding_stride_alignment: 1,
+            .. Limits::default() //TODO: please halp
         }
     }
 
     fn is_valid_cache(&self, cache: &[u8]) -> bool {
-        assert!(cache.len() > 16 + vk::UUID_SIZE);
-        let cache_info: &[u32] = unsafe { slice::from_raw_parts(cache as *const _ as *const _, 4) };
+        const HEADER_SIZE: usize = 16 + vk::UUID_SIZE;
+
+        if cache.len() < HEADER_SIZE {
+            warn!("Bad cache data length {:?}", cache.len());
+            return false;
+        }
+
+        let header_len = u32::from_le_bytes([cache[0], cache[1], cache[2], cache[3]]);
+        let header_version = u32::from_le_bytes([cache[4], cache[5], cache[6], cache[7]]);
+        let vendor_id = u32::from_le_bytes([cache[8], cache[9], cache[10], cache[11]]);
+        let device_id = u32::from_le_bytes([cache[12], cache[13], cache[14], cache[15]]);
 
         // header length
-        if cache_info[0] <= 0 {
-            warn!("Bad header length {:?}", cache_info[0]);
+        if (header_len as usize) < HEADER_SIZE {
+            warn!("Bad header length {:?}", header_len);
             return false;
         }
 
         // cache header version
-        if cache_info[1] != vk::PipelineCacheHeaderVersion::ONE.as_raw() as u32 {
-            warn!("Unsupported cache header version: {:?}", cache_info[1]);
+        if header_version != vk::PipelineCacheHeaderVersion::ONE.as_raw() as u32 {
+            warn!("Unsupported cache header version: {:?}", header_version);
             return false;
         }
 
         // vendor id
-        if cache_info[2] != self.properties.vendor_id {
+        if vendor_id != self.properties.vendor_id {
             warn!(
                 "Vendor ID mismatch. Device: {:?}, cache: {:?}.",
-                self.properties.vendor_id, cache_info[2],
+                self.properties.vendor_id, vendor_id,
             );
             return false;
         }
 
         // device id
-        if cache_info[3] != self.properties.device_id {
+        if device_id != self.properties.device_id {
             warn!(
                 "Device ID mismatch. Device: {:?}, cache: {:?}.",
-                self.properties.device_id, cache_info[3],
+                self.properties.device_id, device_id,
             );
             return false;
         }
@@ -849,8 +928,8 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
 #[doc(hidden)]
 pub struct RawDevice(pub ash::Device, Features);
 impl fmt::Debug for RawDevice {
-    fn fmt(&self, _formatter: &mut fmt::Formatter) -> fmt::Result {
-        unimplemented!()
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "RawDevice") // TODO: Real Debug impl
     }
 }
 impl Drop for RawDevice {
@@ -864,9 +943,12 @@ impl Drop for RawDevice {
 // Need to explicitly synchronize on submission and present.
 pub type RawCommandQueue = Arc<vk::Queue>;
 
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct CommandQueue {
     raw: RawCommandQueue,
     device: Arc<RawDevice>,
+    #[derivative(Debug = "ignore")]
     swapchain_fn: vk::KhrSwapchainFn,
 }
 
@@ -928,7 +1010,7 @@ impl hal::queue::RawCommandQueue<Backend> for CommandQueue {
         &mut self,
         swapchains: Is,
         wait_semaphores: Iw,
-    ) -> Result<(), ()>
+    ) -> Result<Option<Suboptimal>, PresentError>
     where
         W: 'a + Borrow<window::Swapchain>,
         Is: IntoIterator<Item = (&'a W, SwapImageIndex)>,
@@ -959,8 +1041,13 @@ impl hal::queue::RawCommandQueue<Backend> for CommandQueue {
         };
 
         match self.swapchain_fn.queue_present_khr(*self.raw, &info) {
-            vk::Result::SUCCESS => Ok(()),
-            vk::Result::SUBOPTIMAL_KHR | vk::Result::ERROR_OUT_OF_DATE_KHR => Err(()),
+            vk::Result::SUCCESS => Ok(None),
+            vk::Result::SUBOPTIMAL_KHR => Ok(Some(Suboptimal)),
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY => Err(PresentError::OutOfMemory(OutOfMemory::OutOfHostMemory)),
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => Err(PresentError::OutOfMemory(OutOfMemory::OutOfDeviceMemory)),
+            vk::Result::ERROR_DEVICE_LOST => Err(PresentError::DeviceLost(DeviceLost)),
+            vk::Result::ERROR_OUT_OF_DATE_KHR => Err(PresentError::OutOfDate),
+            vk::Result::ERROR_SURFACE_LOST_KHR => Err(PresentError::SurfaceLost(SurfaceLost)),
             _ => panic!("Failed to present frame"),
         }
     }
@@ -976,6 +1063,7 @@ impl hal::queue::RawCommandQueue<Backend> for CommandQueue {
     }
 }
 
+#[derive(Debug)]
 pub struct Device {
     raw: Arc<RawDevice>,
 }
@@ -1016,5 +1104,6 @@ impl hal::Backend for Backend {
 
     type Fence = native::Fence;
     type Semaphore = native::Semaphore;
+    type Event = native::Event;
     type QueryPool = native::QueryPool;
 }

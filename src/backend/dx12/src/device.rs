@@ -10,9 +10,10 @@ use winapi::shared::{dxgi, dxgi1_2, dxgi1_4, dxgiformat, dxgitype, winerror};
 use winapi::um::{d3d12, d3dcompiler, synchapi, winbase, winnt};
 use winapi::Interface;
 
-use hal::format::{Aspects, Format};
+use hal::format::Aspects;
 use hal::memory::Requirements;
 use hal::pool::CommandPoolCreateFlags;
+use hal::pso::VertexInputRate;
 use hal::queue::{QueueFamilyId, RawCommandQueue};
 use hal::range::RangeArg;
 use hal::{self, buffer, device as d, error, format, image, mapping, memory, pass, pso, query};
@@ -40,6 +41,8 @@ const MEM_TYPE_BUFFER_SHIFT: u64 = MEM_TYPE_SHIFT * MemoryGroup::BufferOnly as u
 const MEM_TYPE_IMAGE_SHIFT: u64 = MEM_TYPE_SHIFT * MemoryGroup::ImageOnly as u64;
 const MEM_TYPE_TARGET_SHIFT: u64 = MEM_TYPE_SHIFT * MemoryGroup::TargetOnly as u64;
 
+pub const IDENTITY_MAPPING: UINT = 0x1688; // D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+
 /// Emit error during shader module creation. Used if we don't expect an error
 /// but might panic due to an exception in SPIRV-Cross.
 fn gen_unexpected_error(err: SpirvErrorCode) -> d::ShaderError {
@@ -66,6 +69,7 @@ pub(crate) struct ViewInfo {
     pub(crate) caps: image::ViewCapabilities,
     pub(crate) view_kind: image::ViewKind,
     pub(crate) format: dxgiformat::DXGI_FORMAT,
+    pub(crate) component_mapping: UINT,
     pub(crate) range: image::SubresourceRange,
 }
 
@@ -73,31 +77,6 @@ pub(crate) enum CommandSignature {
     Draw,
     DrawIndexed,
     Dispatch,
-}
-
-#[derive(Debug)]
-pub struct UnboundBuffer {
-    requirements: memory::Requirements,
-    usage: buffer::Usage,
-}
-
-#[derive(Derivative)]
-#[derivative(Debug)]
-pub struct UnboundImage {
-    #[derivative(Debug = "ignore")]
-    desc: d3d12::D3D12_RESOURCE_DESC,
-    dsv_format: dxgiformat::DXGI_FORMAT,
-    requirements: memory::Requirements,
-    format: Format,
-    kind: image::Kind,
-    usage: image::Usage,
-    tiling: image::Tiling,
-    view_caps: image::ViewCapabilities,
-    //TODO: use hal::format::FormatDesc
-    bytes_per_block: u8,
-    // Dimension of a texel block (compressed formats).
-    block_dim: (u8, u8),
-    num_levels: image::Level,
 }
 
 /// Compile a single shader entry point from a HLSL text shader
@@ -252,16 +231,8 @@ impl GraphicsPipelineStateSubobjectStream {
 }
 
 impl Device {
-    fn parse_spirv(raw_data: &[u8]) -> Result<spirv::Ast<hlsl::Target>, d::ShaderError> {
-        // spec requires "codeSize must be a multiple of 4"
-        assert_eq!(raw_data.len() & 3, 0);
-
-        let module = spirv::Module::from_words(unsafe {
-            slice::from_raw_parts(
-                raw_data.as_ptr() as *const u32,
-                raw_data.len() / mem::size_of::<u32>(),
-            )
-        });
+    fn parse_spirv(raw_data: &[u32]) -> Result<spirv::Ast<hlsl::Target>, d::ShaderError> {
+        let module = spirv::Module::from_words(raw_data);
 
         spirv::Ast::parse(&module).map_err(|err| {
             let msg = match err {
@@ -525,7 +496,7 @@ impl Device {
     ) -> r::DescriptorHeap {
         assert_ne!(capacity, 0);
 
-        let (heap, hr) = device.create_descriptor_heap(
+        let (heap, _hr) = device.create_descriptor_heap(
             capacity as _,
             heap_type,
             if shader_visible {
@@ -577,6 +548,7 @@ impl Device {
 
         match info.view_kind {
             image::ViewKind::D1 => {
+                assert_eq!(info.range.layers, 0 .. 1);
                 desc.ViewDimension = d3d12::D3D12_RTV_DIMENSION_TEXTURE1D;
                 *unsafe { desc.u.Texture1D_mut() } = d3d12::D3D12_TEX1D_RTV { MipSlice }
             }
@@ -589,12 +561,14 @@ impl Device {
                 }
             }
             image::ViewKind::D2 if is_msaa => {
+                assert_eq!(info.range.layers, 0 .. 1);
                 desc.ViewDimension = d3d12::D3D12_RTV_DIMENSION_TEXTURE2DMS;
                 *unsafe { desc.u.Texture2DMS_mut() } = d3d12::D3D12_TEX2DMS_RTV {
                     UnusedField_NothingToDefine: 0,
                 }
             }
             image::ViewKind::D2 => {
+                assert_eq!(info.range.layers, 0 .. 1);
                 desc.ViewDimension = d3d12::D3D12_RTV_DIMENSION_TEXTURE2D;
                 *unsafe { desc.u.Texture2D_mut() } = d3d12::D3D12_TEX2D_RTV {
                     MipSlice,
@@ -618,6 +592,7 @@ impl Device {
                 }
             }
             image::ViewKind::D3 => {
+                assert_eq!(info.range.layers, 0 .. 1);
                 desc.ViewDimension = d3d12::D3D12_RTV_DIMENSION_TEXTURE3D;
                 *unsafe { desc.u.Texture3D_mut() } = d3d12::D3D12_TEX3D_RTV {
                     MipSlice,
@@ -675,6 +650,7 @@ impl Device {
 
         match info.view_kind {
             image::ViewKind::D1 => {
+                assert_eq!(info.range.layers, 0 .. 1);
                 desc.ViewDimension = d3d12::D3D12_DSV_DIMENSION_TEXTURE1D;
                 *unsafe { desc.u.Texture1D_mut() } = d3d12::D3D12_TEX1D_DSV { MipSlice }
             }
@@ -687,12 +663,14 @@ impl Device {
                 }
             }
             image::ViewKind::D2 if is_msaa => {
+                assert_eq!(info.range.layers, 0 .. 1);
                 desc.ViewDimension = d3d12::D3D12_DSV_DIMENSION_TEXTURE2DMS;
                 *unsafe { desc.u.Texture2DMS_mut() } = d3d12::D3D12_TEX2DMS_DSV {
                     UnusedField_NothingToDefine: 0,
                 }
             }
             image::ViewKind::D2 => {
+                assert_eq!(info.range.layers, 0 .. 1);
                 desc.ViewDimension = d3d12::D3D12_DSV_DIMENSION_TEXTURE2D;
                 *unsafe { desc.u.Texture2D_mut() } = d3d12::D3D12_TEX2D_DSV { MipSlice }
             }
@@ -739,7 +717,7 @@ impl Device {
         let mut desc = d3d12::D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: info.format,
             ViewDimension: 0,
-            Shader4ComponentMapping: 0x1688, // TODO: map swizzle
+            Shader4ComponentMapping: info.component_mapping,
             u: unsafe { mem::zeroed() },
         };
 
@@ -754,6 +732,7 @@ impl Device {
 
         match info.view_kind {
             image::ViewKind::D1 => {
+                assert_eq!(info.range.layers, 0..1);
                 desc.ViewDimension = d3d12::D3D12_SRV_DIMENSION_TEXTURE1D;
                 *unsafe { desc.u.Texture1D_mut() } = d3d12::D3D12_TEX1D_SRV {
                     MostDetailedMip,
@@ -772,12 +751,14 @@ impl Device {
                 }
             }
             image::ViewKind::D2 if is_msaa => {
+                assert_eq!(info.range.layers, 0..1);
                 desc.ViewDimension = d3d12::D3D12_SRV_DIMENSION_TEXTURE2DMS;
                 *unsafe { desc.u.Texture2DMS_mut() } = d3d12::D3D12_TEX2DMS_SRV {
                     UnusedField_NothingToDefine: 0,
                 }
             }
             image::ViewKind::D2 => {
+                assert_eq!(info.range.layers, 0..1);
                 desc.ViewDimension = d3d12::D3D12_SRV_DIMENSION_TEXTURE2D;
                 *unsafe { desc.u.Texture2D_mut() } = d3d12::D3D12_TEX2D_SRV {
                     MostDetailedMip,
@@ -805,6 +786,7 @@ impl Device {
                 }
             }
             image::ViewKind::D3 => {
+                assert_eq!(info.range.layers, 0..1);
                 desc.ViewDimension = d3d12::D3D12_SRV_DIMENSION_TEXTURE3D;
                 *unsafe { desc.u.Texture3D_mut() } = d3d12::D3D12_TEX3D_SRV {
                     MostDetailedMip,
@@ -891,6 +873,7 @@ impl Device {
 
         match info.view_kind {
             image::ViewKind::D1 => {
+                assert_eq!(info.range.layers, 0..1);
                 desc.ViewDimension = d3d12::D3D12_UAV_DIMENSION_TEXTURE1D;
                 *unsafe { desc.u.Texture1D_mut() } = d3d12::D3D12_TEX1D_UAV { MipSlice }
             }
@@ -903,6 +886,7 @@ impl Device {
                 }
             }
             image::ViewKind::D2 => {
+                assert_eq!(info.range.layers, 0..1);
                 desc.ViewDimension = d3d12::D3D12_UAV_DIMENSION_TEXTURE2D;
                 *unsafe { desc.u.Texture2D_mut() } = d3d12::D3D12_TEX2D_UAV {
                     MipSlice,
@@ -919,6 +903,7 @@ impl Device {
                 }
             }
             image::ViewKind::D3 => {
+                assert_eq!(info.range.layers, 0..1);
                 desc.ViewDimension = d3d12::D3D12_UAV_DIMENSION_TEXTURE3D;
                 *unsafe { desc.u.Texture3D_mut() } = d3d12::D3D12_TEX3D_UAV {
                     MipSlice,
@@ -1083,6 +1068,7 @@ impl d::Device<B> for Device {
             device: self.raw,
             list_type,
             shared: self.shared.clone(),
+            create_flags,
         })
     }
 
@@ -1442,10 +1428,7 @@ impl d::Device<B> for Device {
         })
     }
 
-    unsafe fn create_pipeline_cache(
-        &self,
-        _data: Option<&[u8]>
-    ) -> Result<(), d::OutOfMemory> {
+    unsafe fn create_pipeline_cache(&self, _data: Option<&[u8]>) -> Result<(), d::OutOfMemory> {
         Ok(())
     }
 
@@ -1547,9 +1530,9 @@ impl d::Device<B> for Device {
                     }
                 };
 
-                let slot_class = match buffer_desc.rate {
-                    0 => d3d12::D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
-                    _ => d3d12::D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
+                let (slot_class, step_rate) = match buffer_desc.rate {
+                    VertexInputRate::Vertex => (d3d12::D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0),
+                    VertexInputRate::Instance(divisor) => (d3d12::D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, divisor),
                 };
                 let format = attrib.element.format;
 
@@ -1587,7 +1570,7 @@ impl d::Device<B> for Device {
                     InputSlot: input_slot as _,
                     AlignedByteOffset: offset,
                     InputSlotClass: slot_class,
-                    InstanceDataStepRate: buffer_desc.rate as _,
+                    InstanceDataStepRate: step_rate as _,
                 }))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1795,7 +1778,7 @@ impl d::Device<B> for Device {
 
     unsafe fn create_shader_module(
         &self,
-        raw_data: &[u8],
+        raw_data: &[u32],
     ) -> Result<r::ShaderModule, d::ShaderError> {
         Ok(r::ShaderModule::Spirv(raw_data.into()))
     }
@@ -1954,7 +1937,7 @@ impl d::Device<B> for Device {
             let mut desc = d3d12::D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: format,
                 ViewDimension: d3d12::D3D12_SRV_DIMENSION_BUFFER,
-                Shader4ComponentMapping: 0x1688, // TODO: verify
+                Shader4ComponentMapping: IDENTITY_MAPPING,
                 u: mem::zeroed(),
             };
 
@@ -2053,7 +2036,7 @@ impl d::Device<B> for Device {
                 kind.num_layers() as _
             },
             MipLevels: mip_levels as _,
-            Format: match conv::map_format(format) {
+            Format: match conv::map_surface_type(base_format.0) {
                 Some(format) => format,
                 None => return Err(image::CreationError::Format(format)),
             },
@@ -2081,7 +2064,8 @@ impl d::Device<B> for Device {
         };
 
         Ok(r::Image::Unbound(r::ImageUnbound {
-            dsv_format: conv::map_format_dsv(base_format.0).unwrap_or(desc.Format),
+            view_format: conv::map_format(format),
+            dsv_format: conv::map_format_dsv(base_format.0),
             desc,
             requirements: memory::Requirements {
                 size: alloc_info.SizeInBytes,
@@ -2188,6 +2172,7 @@ impl d::Device<B> for Device {
                 image::Kind::D3(..) => image::ViewKind::D3,
             },
             format: image_unbound.desc.Format,
+            component_mapping: IDENTITY_MAPPING,
             range: image::SubresourceRange {
                 aspects: Aspects::empty(),
                 levels: 0..0,
@@ -2222,14 +2207,17 @@ impl d::Device<B> for Device {
             surface_type: image_unbound.format.base_format().0,
             kind: image_unbound.kind,
             usage: image_unbound.usage,
+            default_view_format: image_unbound.view_format,
             view_caps: image_unbound.view_caps,
             descriptor: image_unbound.desc,
             bytes_per_block: image_unbound.bytes_per_block,
             block_dim: image_unbound.block_dim,
             clear_cv: if aspects.contains(Aspects::COLOR) && can_clear_color {
+                let format = image_unbound.view_format.unwrap();
                 (0..num_layers)
                     .map(|layer| {
                         self.view_image_as_render_target(ViewInfo {
+                            format,
                             range: image::SubresourceRange {
                                 aspects: Aspects::COLOR,
                                 levels: 0..1, //TODO?
@@ -2244,10 +2232,11 @@ impl d::Device<B> for Device {
                 Vec::new()
             },
             clear_dv: if aspects.contains(Aspects::DEPTH) && can_clear_depth {
+                let format = image_unbound.dsv_format.unwrap();
                 (0..num_layers)
                     .map(|layer| {
                         self.view_image_as_depth_stencil(ViewInfo {
-                            format: image_unbound.dsv_format,
+                            format,
                             range: image::SubresourceRange {
                                 aspects: Aspects::DEPTH,
                                 levels: 0..1, //TODO?
@@ -2262,10 +2251,11 @@ impl d::Device<B> for Device {
                 Vec::new()
             },
             clear_sv: if aspects.contains(Aspects::STENCIL) && can_clear_depth {
+                let format = image_unbound.dsv_format.unwrap();
                 (0..num_layers)
                     .map(|layer| {
                         self.view_image_as_depth_stencil(ViewInfo {
-                            format: image_unbound.dsv_format,
+                            format,
                             range: image::SubresourceRange {
                                 aspects: Aspects::STENCIL,
                                 levels: 0..1, //TODO?
@@ -2290,10 +2280,11 @@ impl d::Device<B> for Device {
         image: &r::Image,
         view_kind: image::ViewKind,
         format: format::Format,
-        _swizzle: format::Swizzle,
+        swizzle: format::Swizzle,
         range: image::SubresourceRange,
     ) -> Result<r::ImageView, image::ViewError> {
         let image = image.expect_bound();
+        let is_array = image.kind.num_layers() > 1;
         let mip_levels = (range.levels.start, range.levels.end);
         let layers = (range.layers.start, range.layers.end);
 
@@ -2301,8 +2292,16 @@ impl d::Device<B> for Device {
             resource: image.resource,
             kind: image.kind,
             caps: image.view_caps,
-            view_kind,
+            // D3D12 doesn't allow looking at a single slice of an array as a non-array
+            view_kind: if is_array && view_kind == image::ViewKind::D2 {
+                image::ViewKind::D2Array
+            } else if is_array && view_kind == image::ViewKind::D1 {
+                image::ViewKind::D1Array
+            } else {
+                view_kind
+            },
             format: conv::map_format(format).ok_or(image::ViewError::BadFormat(format))?,
+            component_mapping: conv::map_swizzle(swizzle),
             range,
         };
 
@@ -2337,7 +2336,7 @@ impl d::Device<B> for Device {
             } else {
                 None
             },
-            dxgi_format: image.descriptor.Format,
+            dxgi_format: image.default_view_format.unwrap(),
             num_levels: image.descriptor.MipLevels as image::Level,
             mip_levels,
             layers,
@@ -2386,6 +2385,7 @@ impl d::Device<B> for Device {
         &self,
         max_sets: usize,
         descriptor_pools: I,
+        _flags: pso::DescriptorPoolCreateFlags,
     ) -> Result<r::DescriptorPool, d::OutOfMemory>
     where
         I: IntoIterator,
@@ -2878,6 +2878,22 @@ impl d::Device<B> for Device {
         }
     }
 
+    fn create_event(&self) -> Result<(), d::OutOfMemory> {
+        unimplemented!()
+    }
+
+    unsafe fn get_event_status(&self, event: &()) -> Result<bool, d::OomOrDeviceLost> {
+        unimplemented!()
+    }
+
+    unsafe fn set_event(&self, event: &()) -> Result<(), d::OutOfMemory> {
+        unimplemented!()
+    }
+
+    unsafe fn reset_event(&self, event: &()) -> Result<(), d::OutOfMemory> {
+        unimplemented!()
+    }
+
     unsafe fn free_memory(&self, memory: r::Memory) {
         memory.heap.destroy();
         if let Some(buffer) = memory.resource {
@@ -2995,12 +3011,16 @@ impl d::Device<B> for Device {
         semaphore.raw.destroy();
     }
 
+    unsafe fn destroy_event(&self, event: ()) {
+        unimplemented!()
+    }
+
     unsafe fn create_swapchain(
         &self,
         surface: &mut w::Surface,
         config: hal::SwapchainConfig,
         old_swapchain: Option<w::Swapchain>,
-    ) -> Result<(w::Swapchain, hal::Backbuffer<B>), hal::window::CreationError> {
+    ) -> Result<(w::Swapchain, Vec<r::Image>), hal::window::CreationError> {
         if let Some(old_swapchain) = old_swapchain {
             self.destroy_swapchain(old_swapchain);
         }
@@ -3101,6 +3121,7 @@ impl d::Device<B> for Device {
                     surface_type,
                     kind,
                     usage: config.image_usage,
+                    default_view_format: Some(format),
                     view_caps: image::ViewCapabilities::empty(),
                     descriptor: d3d12::D3D12_RESOURCE_DESC {
                         Dimension: d3d12::D3D12_RESOURCE_DIMENSION_TEXTURE2D,
@@ -3137,7 +3158,7 @@ impl d::Device<B> for Device {
             resources,
         };
 
-        Ok((swapchain, hal::Backbuffer::Images(images)))
+        Ok((swapchain, images))
     }
 
     unsafe fn destroy_swapchain(&self, swapchain: w::Swapchain) {
@@ -3154,4 +3175,10 @@ impl d::Device<B> for Device {
         }
         Ok(())
     }
+}
+
+
+#[test]
+fn test_identity_mapping() {
+    assert_eq!(conv::map_swizzle(format::Swizzle::NO), IDENTITY_MAPPING);
 }

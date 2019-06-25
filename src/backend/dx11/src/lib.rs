@@ -88,7 +88,7 @@ mod internal;
 mod shader;
 
 #[derive(Derivative)]
-#[derivative(Debug)]
+#[derivative(Clone, Debug)]
 pub(crate) struct ViewInfo {
     #[derivative(Debug = "ignore")]
     resource: *mut d3d11::ID3D11Resource,
@@ -338,34 +338,46 @@ impl hal::Instance for Instance {
             };
 
             let limits = hal::Limits {
-                max_texture_size: d3d11::D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION as _,
+                max_image_1d_size: d3d11::D3D11_REQ_TEXTURE1D_U_DIMENSION as _,
+                max_image_2d_size: d3d11::D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION as _,
+                max_image_3d_size: d3d11::D3D11_REQ_TEXTURE3D_U_V_OR_W_DIMENSION as _,
+                max_image_cube_size: d3d11::D3D11_REQ_TEXTURECUBE_DIMENSION as _,
+                max_image_array_layers: d3d11::D3D11_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION as _,
                 max_texel_elements: d3d11::D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION as _, //TODO
                 max_patch_size: 0,                                                    // TODO
                 max_viewports: d3d11::D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE as _,
-                max_compute_group_count: [
+                max_viewport_dimensions: [d3d11::D3D11_VIEWPORT_BOUNDS_MAX; 2],
+                max_framebuffer_extent: hal::image::Extent { //TODO
+                    width: 4096,
+                    height: 4096,
+                    depth: 1,
+                },
+                max_compute_work_group_count: [
                     d3d11::D3D11_CS_THREAD_GROUP_MAX_X,
                     d3d11::D3D11_CS_THREAD_GROUP_MAX_Y,
                     d3d11::D3D11_CS_THREAD_GROUP_MAX_Z,
                 ],
-                max_compute_group_size: [d3d11::D3D11_CS_THREAD_GROUP_MAX_THREADS_PER_GROUP, 1, 1], // TODO
+                max_compute_work_group_size: [d3d11::D3D11_CS_THREAD_GROUP_MAX_THREADS_PER_GROUP, 1, 1], // TODO
                 max_vertex_input_attribute_offset: 255, // TODO
                 max_vertex_input_attributes: d3d11::D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT as _,
                 max_vertex_input_binding_stride:
                     d3d11::D3D11_REQ_MULTI_ELEMENT_STRUCTURE_SIZE_IN_BYTES as _,
                 max_vertex_input_bindings: d3d11::D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT as _, // TODO: verify same as attributes
                 max_vertex_output_components: d3d11::D3D11_VS_OUTPUT_REGISTER_COUNT as _, // TODO
-                min_buffer_copy_offset_alignment: 1,                                      // TODO
-                min_buffer_copy_pitch_alignment: 1,                                       // TODO
                 min_texel_buffer_offset_alignment: 1,                                     // TODO
                 min_uniform_buffer_offset_alignment: 16, // TODO: verify
                 min_storage_buffer_offset_alignment: 1,  // TODO
                 framebuffer_color_samples_count: 1,      // TODO
                 framebuffer_depth_samples_count: 1,      // TODO
                 framebuffer_stencil_samples_count: 1,    // TODO
-                max_color_attachments: 1,                // TODO
+                max_color_attachments: d3d11::D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT as _,
+                buffer_image_granularity: 1,
                 non_coherent_atom_size: 1,               // TODO
                 max_sampler_anisotropy: 16.,
+                optimal_buffer_copy_offset_alignment: 1,                                      // TODO
+                optimal_buffer_copy_pitch_alignment: 1,                                       // TODO
                 min_vertex_input_binding_stride_alignment: 1,
+                .. hal::Limits::default() //TODO
             };
 
             let features = get_features(device.clone(), feature_level);
@@ -655,7 +667,10 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
     }
 }
 
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct Surface {
+    #[derivative(Debug = "ignore")]
     pub(crate) factory: ComPtr<IDXGIFactory>,
     wnd_handle: HWND,
     width: u32,
@@ -710,7 +725,7 @@ impl hal::Surface<Backend> for Surface {
             format::Format::Rgba8Srgb,
             format::Format::Rgba8Unorm,
             format::Format::A2b10g10r10Unorm,
-            format::Format::Rgba16Float,
+            format::Format::Rgba16Sfloat,
         ];
 
         let present_modes = vec![
@@ -721,7 +736,10 @@ impl hal::Surface<Backend> for Surface {
     }
 }
 
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct Swapchain {
+    #[derivative(Debug = "ignore")]
     dxgi_swapchain: ComPtr<IDXGISwapChain>,
 }
 
@@ -732,12 +750,13 @@ impl hal::Swapchain<Backend> for Swapchain {
     unsafe fn acquire_image(
         &mut self,
         _timeout_ns: u64,
-        _sync: hal::FrameSync<Backend>,
-    ) -> Result<hal::SwapImageIndex, hal::AcquireError> {
+        _semaphore: Option<&Semaphore>,
+        _fence: Option<&Fence>,
+    ) -> Result<(hal::SwapImageIndex, Option<hal::window::Suboptimal>), hal::AcquireError> {
         // TODO: non-`_DISCARD` swap effects have more than one buffer, `FLIP`
         //       effects are dxgi 1.3 (w10+?) in which case there is
         //       `GetCurrentBackBufferIndex()` on the swapchain
-        Ok(0)
+        Ok((0, None))
     }
 }
 
@@ -815,7 +834,7 @@ impl hal::queue::RawCommandQueue<Backend> for CommandQueue {
         &mut self,
         swapchains: Is,
         _wait_semaphores: Iw,
-    ) -> Result<(), ()>
+    ) -> Result<Option<hal::window::Suboptimal>, hal::window::PresentError>
     where
         W: 'a + Borrow<Swapchain>,
         Is: IntoIterator<Item = (&'a W, hal::SwapImageIndex)>,
@@ -828,7 +847,7 @@ impl hal::queue::RawCommandQueue<Backend> for CommandQueue {
             }
         }
 
-        Ok(())
+        Ok(None)
     }
 
     fn wait_idle(&self) -> Result<(), error::HostExecutionError> {
@@ -1460,16 +1479,16 @@ impl hal::command::RawCommandBuffer<Backend> for CommandBuffer {
             fn typed_clear_color(ty: ChannelType, raw_clear: ClearColorRaw) -> ClearColor {
                 match ty {
                     ChannelType::Unorm
-                    | ChannelType::Inorm
+                    | ChannelType::Snorm
                     | ChannelType::Ufloat
-                    | ChannelType::Float
+                    | ChannelType::Sfloat
                     | ChannelType::Uscaled
-                    | ChannelType::Iscaled
-                    | ChannelType::Srgb => ClearColor::Float(unsafe { raw_clear.float32 }),
+                    | ChannelType::Sscaled
+                    | ChannelType::Srgb => ClearColor::Sfloat(unsafe { raw_clear.float32 }),
 
                     ChannelType::Uint => ClearColor::Uint(unsafe { raw_clear.uint32 }),
 
-                    ChannelType::Int => ClearColor::Int(unsafe { raw_clear.int32 }),
+                    ChannelType::Sint => ClearColor::Sint(unsafe { raw_clear.int32 }),
                 }
             }
 
@@ -1711,7 +1730,7 @@ impl hal::command::RawCommandBuffer<Backend> for CommandBuffer {
         }
     }
 
-    unsafe fn bind_vertex_buffers<I, T>(&mut self, first_binding: u32, buffers: I)
+    unsafe fn bind_vertex_buffers<I, T>(&mut self, first_binding: pso::BufferIndex, buffers: I)
     where
         I: IntoIterator<Item = (T, buffer::Offset)>,
         T: Borrow<Buffer>,
@@ -1955,9 +1974,7 @@ impl hal::command::RawCommandBuffer<Backend> for CommandBuffer {
     }
 
     unsafe fn dispatch(&mut self, count: WorkGroupCount) {
-        unsafe {
-            self.context.Dispatch(count[0], count[1], count[2]);
-        }
+        self.context.Dispatch(count[0], count[1], count[2]);
     }
 
     unsafe fn dispatch_indirect(&mut self, _buffer: &Buffer, _offset: buffer::Offset) {
@@ -1986,24 +2003,36 @@ impl hal::command::RawCommandBuffer<Backend> for CommandBuffer {
 
         for region in regions.into_iter() {
             let info = region.borrow();
+            let dst_box = d3d11::D3D11_BOX {
+                left: info.src as _,
+                top: 0,
+                front: 0,
+                right: (info.src + info.size) as _,
+                bottom: 1,
+                back: 1,
+            };
 
-            unsafe {
+            self.context.CopySubresourceRegion(
+                dst.internal.raw as _,
+                0,
+                info.dst as _,
+                0,
+                0,
+                src.internal.raw as _,
+                0,
+                &dst_box,
+            );
+
+            if let Some(disjoint_cb) = dst.internal.disjoint_cb {
                 self.context.CopySubresourceRegion(
-                    dst.internal.raw as _,
+                    disjoint_cb as _,
                     0,
                     info.dst as _,
                     0,
                     0,
                     src.internal.raw as _,
                     0,
-                    &d3d11::D3D11_BOX {
-                        left: info.src as _,
-                        top: 0,
-                        front: 0,
-                        right: (info.src + info.size) as _,
-                        bottom: 1,
-                        back: 1,
-                    },
+                    &dst_box,
                 );
             }
         }
@@ -2061,14 +2090,12 @@ impl hal::command::RawCommandBuffer<Backend> for CommandBuffer {
     }
 
     unsafe fn draw(&mut self, vertices: Range<VertexCount>, instances: Range<InstanceCount>) {
-        unsafe {
-            self.context.DrawInstanced(
-                vertices.end - vertices.start,
-                instances.end - instances.start,
-                vertices.start,
-                instances.start,
-            );
-        }
+        self.context.DrawInstanced(
+            vertices.end - vertices.start,
+            instances.end - instances.start,
+            vertices.start,
+            instances.start,
+        );
     }
 
     unsafe fn draw_indexed(
@@ -2077,15 +2104,13 @@ impl hal::command::RawCommandBuffer<Backend> for CommandBuffer {
         base_vertex: VertexOffset,
         instances: Range<InstanceCount>,
     ) {
-        unsafe {
-            self.context.DrawIndexedInstanced(
-                indices.end - indices.start,
-                instances.end - instances.start,
-                indices.start,
-                base_vertex,
-                instances.start,
-            );
-        }
+        self.context.DrawIndexedInstanced(
+            indices.end - indices.start,
+            instances.end - instances.start,
+            indices.start,
+            base_vertex,
+            instances.start,
+        );
     }
 
     unsafe fn draw_indirect(
@@ -2105,6 +2130,28 @@ impl hal::command::RawCommandBuffer<Backend> for CommandBuffer {
         _draw_count: DrawCount,
         _stride: u32,
     ) {
+        unimplemented!()
+    }
+
+    unsafe fn set_event(&mut self, _: &(), _: pso::PipelineStage) {
+        unimplemented!()
+    }
+
+    unsafe fn reset_event(&mut self, _: &(), _: pso::PipelineStage) {
+        unimplemented!()
+    }
+
+    unsafe fn wait_events<'a, I, J>(
+        &mut self,
+        _: I,
+        _: Range<pso::PipelineStage>,
+        _: J
+    ) where
+        I: IntoIterator,
+        I::Item: Borrow<()>,
+        J: IntoIterator,
+        J::Item: Borrow<memory::Barrier<'a, Backend>>,
+    {
         unimplemented!()
     }
 
@@ -2167,8 +2214,8 @@ impl hal::command::RawCommandBuffer<Backend> for CommandBuffer {
 bitflags! {
     struct MemoryHeapFlags: u64 {
         const DEVICE_LOCAL = 0x1;
-        const HOST_NONCOHERENT = 0x4 | 0x8;
-        const HOST_COHERENT = 0x2 | 0x4 | 0x8;
+        const HOST_VISIBLE = 0x2 | 0x4;
+        const HOST_COHERENT = 0x2;
     }
 }
 
@@ -2443,6 +2490,7 @@ impl Memory {
     }
 }
 
+#[derive(Debug)]
 pub struct CommandPool {
     device: ComPtr<d3d11::ID3D11Device>,
     internal: internal::Internal,
@@ -2452,7 +2500,7 @@ unsafe impl Send for CommandPool {}
 unsafe impl Sync for CommandPool {}
 
 impl hal::pool::RawCommandPool<Backend> for CommandPool {
-    unsafe fn reset(&mut self) {
+    unsafe fn reset(&mut self, _release_resources: bool) {
         //unimplemented!()
     }
 
@@ -2475,7 +2523,7 @@ impl hal::pool::RawCommandPool<Backend> for CommandPool {
 //#[derivative(Debug)]
 pub enum ShaderModule {
     Dxbc(Vec<u8>),
-    Spirv(Vec<u8>),
+    Spirv(Vec<u32>),
 }
 
 // TODO: temporary
@@ -3028,6 +3076,7 @@ impl hal::Backend for Backend {
 
     type Fence = Fence;
     type Semaphore = Semaphore;
+    type Event = ();
     type QueryPool = QueryPool;
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "gfx-hal"
-version = "0.1.0"
+version = "0.2.1"
 description = "gfx-rs hardware abstraction layer"
 homepage = "https://github.com/gfx-rs/gfx"
 repository = "https://github.com/gfx-rs/gfx"
@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 authors = ["The Gfx-rs Developers"]
 documentation = "https://docs.rs/gfx-hal"
 workspace = "../.."
+edition = "2018"
 
 [features]
 unstable = []
@@ -25,4 +26,4 @@ serde = { version = "1", features = ["serde_derive"], optional = true }
 fxhash = "0.2.1"
 
 [dev-dependencies]
-gfx-backend-empty = { path = "../backend/empty", version = "0.1" }
+gfx-backend-empty = { path = "../backend/empty", version = "0.2" }

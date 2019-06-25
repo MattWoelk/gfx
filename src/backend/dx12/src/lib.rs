@@ -30,8 +30,8 @@ use hal::queue::{QueueFamilyId, Queues};
 use hal::{error, format as f, image, memory, Features, Limits, QueueType, SwapImageIndex};
 
 use winapi::shared::minwindef::TRUE;
-use winapi::shared::{dxgi, dxgi1_2, dxgi1_3, dxgi1_4, winerror};
-use winapi::um::{d3d12, d3d12sdklayers, handleapi, synchapi, winbase};
+use winapi::shared::{dxgi, dxgi1_2, dxgi1_3, dxgi1_4, dxgi1_6, winerror};
+use winapi::um::{d3d12, d3d12sdklayers, dxgidebug, handleapi, synchapi, winbase};
 use winapi::Interface;
 
 use std::borrow::Borrow;
@@ -42,6 +42,7 @@ use std::{mem, ptr};
 
 use native::descriptor;
 
+#[derive(Debug)]
 pub(crate) struct HeapProperties {
     pub page_property: d3d12::D3D12_CPU_PAGE_PROPERTY,
     pub memory_pool: d3d12::D3D12_MEMORY_POOL,
@@ -178,10 +179,14 @@ static QUEUE_FAMILIES: [QueueFamily; 4] = [
     QueueFamily::Normal(QueueType::Transfer),
 ];
 
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct PhysicalDevice {
+    #[derivative(Debug = "ignore")]
     adapter: native::WeakPtr<dxgi1_2::IDXGIAdapter2>,
-    features: hal::Features,
-    limits: hal::Limits,
+    features: Features,
+    limits: Limits,
+    #[derivative(Debug = "ignore")]
     format_properties: Arc<FormatProperties>,
     private_caps: Capabilities,
     heap_properties: &'static [HeapProperties; NUM_HEAP_PROPERTIES],
@@ -198,7 +203,7 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
     unsafe fn open(
         &self,
         families: &[(&QueueFamily, &[hal::QueuePriority])],
-        requested_features: hal::Features,
+        requested_features: Features,
     ) -> Result<hal::Gpu<Backend>, error::DeviceCreationError> {
         let lock = self.is_open.try_lock();
         let mut open_guard = match lock {
@@ -402,10 +407,12 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Derivative)]
+#[derivative(Debug)]
 pub struct CommandQueue {
     pub(crate) raw: native::CommandQueue,
     idle_fence: native::Fence,
+    #[derivative(Debug = "ignore")]
     idle_event: native::sync::Event,
 }
 
@@ -455,7 +462,7 @@ impl hal::queue::RawCommandQueue<Backend> for CommandQueue {
         &mut self,
         swapchains: Is,
         _wait_semaphores: Iw,
-    ) -> Result<(), ()>
+    ) -> Result<Option<hal::window::Suboptimal>, hal::window::PresentError>
     where
         W: 'a + Borrow<window::Swapchain>,
         Is: IntoIterator<Item = (&'a W, SwapImageIndex)>,
@@ -467,7 +474,7 @@ impl hal::queue::RawCommandQueue<Backend> for CommandQueue {
             swapchain.borrow().inner.Present(1, 0);
         }
 
-        Ok(())
+        Ok(None)
     }
 
     fn wait_idle(&self) -> Result<(), error::HostExecutionError> {
@@ -498,7 +505,7 @@ pub struct Capabilities {
     memory_architecture: MemoryArchitecture,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct CmdSignatures {
     draw: native::CommandSignature,
     draw_indexed: native::CommandSignature,
@@ -514,6 +521,7 @@ impl CmdSignatures {
 }
 
 // Shared objects between command buffers, owned by the device.
+#[derive(Debug)]
 struct Shared {
     pub signatures: CmdSignatures,
     pub service_pipes: internal::ServicePipes,
@@ -526,6 +534,8 @@ impl Shared {
     }
 }
 
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct Device {
     raw: native::Device,
     private_caps: Capabilities,
@@ -540,7 +550,9 @@ pub struct Device {
     // CPU/GPU descriptor heaps
     heap_srv_cbv_uav: Mutex<resource::DescriptorHeap>,
     heap_sampler: Mutex<resource::DescriptorHeap>,
+    #[derivative(Debug = "ignore")]
     events: Mutex<Vec<native::Event>>,
+    #[derivative(Debug = "ignore")]
     shared: Arc<Shared>,
     // Present queue exposed by the `Present` queue family.
     // Required for swapchain creation. Only a single queue supports presentation.
@@ -694,12 +706,33 @@ impl Instance {
             }
         }
 
+        // The `DXGI_CREATE_FACTORY_DEBUG` flag is only allowed to be passed to
+        // `CreateDXGIFactory2` if the debug interface is actually available. So
+        // we check for whether it exists first.
+        let mut queue = native::WeakPtr::<dxgidebug::IDXGIInfoQueue>::null();
+        let hr = unsafe {
+            dxgi1_3::DXGIGetDebugInterface1(
+                0,
+                &dxgidebug::IDXGIInfoQueue::uuidof(),
+                queue.mut_void(),
+            )
+        };
+
+        let factory_flags = if winerror::SUCCEEDED(hr) {
+            unsafe {
+                queue.destroy();
+            }
+            dxgi1_3::DXGI_CREATE_FACTORY_DEBUG
+        } else {
+            0
+        };
+
         // Create DXGI factory
         let mut dxgi_factory = native::WeakPtr::<dxgi1_4::IDXGIFactory4>::null();
 
         let hr = unsafe {
             dxgi1_3::CreateDXGIFactory2(
-                dxgi1_3::DXGI_CREATE_FACTORY_DEBUG,
+                factory_flags,
                 &dxgi1_4::IDXGIFactory4::uuidof(),
                 dxgi_factory.mut_void(),
             )
@@ -721,11 +754,40 @@ impl hal::Instance for Instance {
     fn enumerate_adapters(&self) -> Vec<hal::Adapter<Backend>> {
         use self::memory::Properties;
 
+        // Try to use high performance order by default (returns None on Windows < 1803)
+        let (use_f6, factory6) = unsafe {
+            let (f6, hr) = self.factory.cast::<dxgi1_6::IDXGIFactory6>();
+            if winerror::SUCCEEDED(hr) {
+                // It's okay to decrement the refcount here because we
+                // have another reference to the factory already owned by `self`.
+                unsafe { f6.destroy(); }
+                (true, f6)
+            } else {
+                (false, native::WeakPtr::null())
+            }
+        };
+
         // Enumerate adapters
         let mut cur_index = 0;
         let mut adapters = Vec::new();
         loop {
-            let adapter = {
+            let adapter = if use_f6 {
+                let mut adapter2 = native::WeakPtr::<dxgi1_2::IDXGIAdapter2>::null();
+                let hr = unsafe {
+                    factory6.EnumAdapterByGpuPreference(
+                        cur_index,
+                        2, // HIGH_PERFORMANCE
+                        &dxgi1_2::IDXGIAdapter2::uuidof(),
+                        adapter2.mut_void() as *mut *mut _,
+                    )
+                };
+
+                if hr == winerror::DXGI_ERROR_NOT_FOUND {
+                    break;
+                }
+
+                adapter2
+            } else {
                 let mut adapter1 = native::WeakPtr::<dxgi::IDXGIAdapter1>::null();
                 let hr1 = unsafe {
                     self.factory
@@ -925,6 +987,9 @@ impl hal::Instance for Instance {
                         // a corresponding buffer for mapping.
                         if i == MemoryGroup::ImageOnly as _ || i == MemoryGroup::TargetOnly as _ {
                             ty.properties.remove(Properties::CPU_VISIBLE);
+                            // Coherent and cached can only be on memory types that are cpu visible
+                            ty.properties.remove(Properties::COHERENT);
+                            ty.properties.remove(Properties::CPU_CACHED);
                         }
                         ty
                     }));
@@ -984,18 +1049,29 @@ impl hal::Instance for Instance {
                     Features::MULTI_DRAW_INDIRECT |
                     Features::FORMAT_BC |
                     Features::INSTANCE_RATE |
-                    Features::SAMPLER_MIP_LOD_BIAS,
+                    Features::SAMPLER_MIP_LOD_BIAS |
+                    Features::SAMPLER_ANISOTROPY,
                 limits: Limits { // TODO
-                    max_texture_size: 0,
+                    max_image_1d_size: d3d12::D3D12_REQ_TEXTURE1D_U_DIMENSION as _,
+                    max_image_2d_size: d3d12::D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION as _,
+                    max_image_3d_size: d3d12::D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION as _,
+                    max_image_cube_size: d3d12::D3D12_REQ_TEXTURECUBE_DIMENSION as _,
+                    max_image_array_layers: d3d12::D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION as _,
                     max_texel_elements: 0,
                     max_patch_size: 0,
-                    max_viewports: 0,
-                    max_compute_group_count: [
+                    max_viewports: d3d12::D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE as _,
+                    max_viewport_dimensions: [d3d12::D3D12_VIEWPORT_BOUNDS_MAX as _; 2],
+                    max_framebuffer_extent: hal::image::Extent { //TODO
+                        width: 4096,
+                        height: 4096,
+                        depth: 1,
+                    },
+                    max_compute_work_group_count: [
                         d3d12::D3D12_CS_THREAD_GROUP_MAX_X,
                         d3d12::D3D12_CS_THREAD_GROUP_MAX_Y,
                         d3d12::D3D12_CS_THREAD_GROUP_MAX_Z,
                     ],
-                    max_compute_group_size: [
+                    max_compute_work_group_size: [
                         d3d12::D3D12_CS_THREAD_GROUP_MAX_THREADS_PER_GROUP,
                         1, //TODO
                         1, //TODO
@@ -1005,8 +1081,6 @@ impl hal::Instance for Instance {
                     max_vertex_input_attribute_offset: 255, // TODO
                     max_vertex_input_binding_stride: d3d12::D3D12_REQ_MULTI_ELEMENT_STRUCTURE_SIZE_IN_BYTES as _,
                     max_vertex_output_components: 16, // TODO
-                    min_buffer_copy_offset_alignment: d3d12::D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as _,
-                    min_buffer_copy_pitch_alignment: d3d12::D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as _,
                     min_texel_buffer_offset_alignment: 1, // TODO
                     min_uniform_buffer_offset_alignment: 256, // Required alignment for CBVs
                     min_storage_buffer_offset_alignment: 1, // TODO
@@ -1015,10 +1089,14 @@ impl hal::Instance for Instance {
                     framebuffer_color_samples_count: 0b101,
                     framebuffer_depth_samples_count: 0b101,
                     framebuffer_stencil_samples_count: 0b101,
-                    max_color_attachments: 1, // TODO
+                    max_color_attachments: d3d12::D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT as _,
+                    buffer_image_granularity: 1,
                     non_coherent_atom_size: 1, //TODO: confirm
                     max_sampler_anisotropy: 16.,
+                    optimal_buffer_copy_offset_alignment: d3d12::D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as _,
+                    optimal_buffer_copy_pitch_alignment: d3d12::D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as _,
                     min_vertex_input_binding_stride_alignment: 1,
+                    .. Limits::default() //TODO
                 },
                 format_properties: Arc::new(FormatProperties::new(device)),
                 private_caps: Capabilities {
@@ -1081,6 +1159,7 @@ impl hal::Backend for Backend {
 
     type Fence = resource::Fence;
     type Semaphore = resource::Semaphore;
+    type Event = ();
     type QueryPool = resource::QueryPool;
 }
 
@@ -1091,6 +1170,7 @@ fn validate_line_width(width: f32) {
     assert_eq!(width, 1.0);
 }
 
+#[derive(Debug)]
 pub struct FormatProperties(
     Box<[Mutex<Option<f::Properties>>]>,
     native::Device,

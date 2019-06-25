@@ -1,25 +1,71 @@
-extern crate gfx_hal as hal;
-extern crate metal;
-extern crate range_alloc;
+/*!
+# Metal backend internals.
+
+## Pipeline Layout
+
+In Metal, push constants, vertex buffers, and resources in the descriptor sets
+are all placed together in the native resource bindings, which work similarly to D3D11:
+there are tables of textures, buffers, and samplers.
+
+We put push constants first (if any) in the table, followed by descriptor set 0
+resource, followed by other descriptor sets. The vertex buffers are bound at the very
+end of the VS buffer table.
+
+When argument buffers are supported, each descriptor set becomes a buffer binding,
+but the general placement rule is the same.
+
+## Command recording
+
+One-time-submit primary command buffers are recorded "live" into `MTLCommandBuffer`.
+Special care is taken to the recording state: active bindings are restored at the
+start of any render or compute pass.
+
+Multi-submit and secondary command buffers are recorded as "soft" commands into
+`Journal`. Actual native recording is done at either `submit` or `execute_commands`
+correspondingly. When that happens, we `enqueue` the command buffer at the start
+of recording, which allows the driver to work on pass translation at the same time
+as we are recording the following passes.
+
+## Memory
+
+In general, "Shared" storage is used for CPU-coherent memory. "Managed" is used for
+non-coherent CPU-visible memory. Finally, "Private" storage is backing device-local
+memory types.
+
+Metal doesn't have CPU-visible memory for textures. We only allow RGBA8 2D textures
+to be allocated from it, and only for the matter of transfer operations, which is
+the minimum required by Vulkan. In fact, these become just glorified staging buffers.
+!*/
+
 #[macro_use]
 extern crate bitflags;
-extern crate cocoa;
-extern crate foreign_types;
 #[macro_use]
 extern crate objc;
-extern crate core_graphics;
 #[macro_use]
 extern crate log;
-extern crate block;
-extern crate parking_lot;
-extern crate smallvec;
-extern crate spirv_cross;
-extern crate storage_map;
 
+use hal;
+use hal::queue::QueueFamilyId;
+use range_alloc::RangeAllocator;
+
+use cocoa;
+use cocoa::foundation::NSInteger;
+use core_graphics::base::CGFloat;
+use core_graphics::geometry::CGRect;
+use foreign_types::ForeignTypeRef;
+use metal::MTLFeatureSet;
+use metal::MTLLanguageVersion;
+use objc::runtime::{Object, BOOL, YES};
+use parking_lot::{Condvar, Mutex};
 #[cfg(feature = "dispatch")]
-extern crate dispatch;
+use dispatch;
 #[cfg(feature = "winit")]
-extern crate winit;
+use winit;
+
+use std::mem;
+use std::os::raw::c_void;
+use std::ptr::NonNull;
+use std::sync::Arc;
 
 mod command;
 mod conversions;
@@ -29,27 +75,12 @@ mod native;
 mod soft;
 mod window;
 
-pub use command::CommandPool;
-pub use device::{Device, LanguageVersion, PhysicalDevice};
-pub use window::{AcquireMode, CAMetalLayer, Surface, Swapchain};
+pub use crate::command::CommandPool;
+pub use crate::device::{Device, LanguageVersion, PhysicalDevice};
+pub use crate::window::{AcquireMode, CAMetalLayer, Surface, Swapchain};
 
 pub type GraphicsCommandPool = CommandPool;
 
-use std::mem;
-use std::os::raw::c_void;
-use std::ptr::NonNull;
-use std::sync::Arc;
-
-use hal::queue::QueueFamilyId;
-
-use cocoa::foundation::NSInteger;
-use core_graphics::base::CGFloat;
-use core_graphics::geometry::CGRect;
-use foreign_types::ForeignTypeRef;
-use metal::MTLFeatureSet;
-use metal::MTLLanguageVersion;
-use objc::runtime::{Object, BOOL, YES};
-use parking_lot::{Condvar, Mutex};
 
 //TODO: investigate why exactly using `u8` here is slower (~5% total).
 /// A type representing Metal binding's resource index.
@@ -75,6 +106,8 @@ impl Default for OnlineRecording {
 
 const MAX_ACTIVE_COMMAND_BUFFERS: usize = 1 << 14;
 const MAX_VISIBILITY_QUERIES: usize = 1 << 14;
+const MAX_COLOR_ATTACHMENTS: usize = 4;
+const MAX_BOUND_DESCRIPTOR_SETS: usize = 8;
 
 #[derive(Debug, Clone, Copy)]
 pub struct QueueFamily {}
@@ -91,15 +124,17 @@ impl hal::QueueFamily for QueueFamily {
     }
 }
 
+#[derive(Debug)]
 struct VisibilityShared {
     /// Availability buffer is in shared memory, it has N double words for
     /// query results followed by N words for the availability.
     buffer: metal::Buffer,
-    allocator: Mutex<range_alloc::RangeAllocator<hal::query::Id>>,
+    allocator: Mutex<RangeAllocator<hal::query::Id>>,
     availability_offset: hal::buffer::Offset,
     condvar: Condvar,
 }
 
+#[derive(Debug)]
 struct Shared {
     device: Mutex<metal::Device>,
     queue: Mutex<command::QueueInner>,
@@ -113,8 +148,8 @@ unsafe impl Send for Shared {}
 unsafe impl Sync for Shared {}
 
 impl Shared {
-    fn new(device: metal::Device) -> Self {
-        let private_caps = PrivateCapabilities::new(&device);
+    fn new(device: metal::Device, experiments: &Experiments) -> Self {
+        let private_caps = PrivateCapabilities::new(&device, experiments);
 
         let visibility = VisibilityShared {
             buffer: device.new_buffer(
@@ -122,7 +157,7 @@ impl Shared {
                     * (mem::size_of::<u64>() + mem::size_of::<u32>()) as u64,
                 metal::MTLResourceOptions::StorageModeShared,
             ),
-            allocator: Mutex::new(range_alloc::RangeAllocator::new(
+            allocator: Mutex::new(RangeAllocator::new(
                 0..MAX_VISIBILITY_QUERIES as hal::query::Id,
             )),
             availability_offset: (MAX_VISIBILITY_QUERIES * mem::size_of::<u64>())
@@ -146,7 +181,14 @@ impl Shared {
     }
 }
 
-pub struct Instance;
+#[derive(Clone, Debug, Default)]
+pub struct Experiments {
+    pub argument_buffers: bool,
+}
+
+pub struct Instance {
+    pub experiments: Experiments,
+}
 
 impl hal::Instance for Instance {
     type Backend = Backend;
@@ -157,7 +199,8 @@ impl hal::Instance for Instance {
             .into_iter()
             .map(|dev| {
                 let name = dev.name().into();
-                let physical_device = device::PhysicalDevice::new(Arc::new(Shared::new(dev)));
+                let shared = Shared::new(dev, &self.experiments);
+                let physical_device = device::PhysicalDevice::new(Arc::new(shared));
                 hal::Adapter {
                     info: hal::AdapterInfo {
                         name,
@@ -186,78 +229,26 @@ impl hal::Instance for Instance {
 
 impl Instance {
     pub fn create(_: &str, _: u32) -> Self {
-        Instance
-    }
-
-    unsafe fn create_from_layer(&self, layer: CAMetalLayer) -> window::SurfaceInner {
-        let class = class!(CAMetalLayer);
-        let proper_kind: BOOL = msg_send![layer, isKindOfClass: class];
-        assert_eq!(proper_kind, YES);
-        msg_send![layer, retain];
-        window::SurfaceInner::new(None, layer)
-    }
-
-    pub fn create_surface_from_layer(&self, layer: CAMetalLayer) -> Surface {
-        unsafe { self.create_from_layer(layer) }.into_surface()
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Instance {
-    unsafe fn create_from_nsview(&self, nsview: *mut c_void) -> window::SurfaceInner {
-        let class = class!(CAMetalLayer);
-        let view: cocoa::base::id = mem::transmute(nsview);
-        if view.is_null() {
-            panic!("window does not have a valid contentView");
+        Instance {
+             experiments: Experiments::default(),
         }
-
-        // temporary, hopefully!
-        let is_actually_layer: BOOL = msg_send![view, isKindOfClass: class];
-        if is_actually_layer == YES {
-            return self.create_from_layer(view);
-        }
-
-        let existing: CAMetalLayer = msg_send![view, layer];
-        let use_current = if existing.is_null() {
-            false
-        } else {
-            let result: BOOL = msg_send![existing, isKindOfClass: class];
-            result == YES
-        };
-
-        let render_layer: CAMetalLayer = if use_current {
-            existing
-        } else {
-            let layer: CAMetalLayer = msg_send![class, new];
-            msg_send![view, setLayer: layer];
-            msg_send![view, retain];
-            let bounds: CGRect = msg_send![view, bounds];
-            msg_send![layer, setBounds: bounds];
-
-            let window: cocoa::base::id = msg_send![view, window];
-            if !window.is_null() {
-                let scale_factor: CGFloat = msg_send![window, backingScaleFactor];
-                msg_send![layer, setContentsScale: scale_factor];
-            }
-            layer
-        };
-
-        window::SurfaceInner::new(NonNull::new(view), render_layer)
-    }
-
-    pub fn create_surface_from_nsview(&self, nsview: *mut c_void) -> Surface {
-        unsafe { self.create_from_nsview(nsview) }.into_surface()
     }
 
     #[cfg(feature = "winit")]
     pub fn create_surface(&self, window: &winit::Window) -> Surface {
-        use winit::os::macos::WindowExt;
-        self.create_surface_from_nsview(window.get_nsview())
+        #[cfg(target_os = "ios")]
+        {
+            use winit::os::ios::WindowExt;
+            self.create_surface_from_uiview(window.get_uiview(), false)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use winit::os::macos::WindowExt;
+            self.create_surface_from_nsview(window.get_nsview(), false)
+        }
     }
-}
 
-#[cfg(target_os = "ios")]
-impl Instance {
+    #[cfg(target_os = "ios")]
     unsafe fn create_from_uiview(&self, uiview: *mut c_void) -> window::SurfaceInner {
         let view: cocoa::base::id = mem::transmute(uiview);
         if view.is_null() {
@@ -300,14 +291,68 @@ impl Instance {
         window::SurfaceInner::new(NonNull::new(view), render_layer)
     }
 
-    pub fn create_surface_from_uiview(&self, uiview: *mut c_void) -> Surface {
-        unsafe { self.create_from_uiview(uiview) }.into_surface()
+    #[cfg(target_os = "macos")]
+    unsafe fn create_from_nsview(&self, nsview: *mut c_void) -> window::SurfaceInner {
+        let view: cocoa::base::id = mem::transmute(nsview);
+        if view.is_null() {
+            panic!("window does not have a valid contentView");
+        }
+
+        let existing: CAMetalLayer = msg_send![view, layer];
+        let class = class!(CAMetalLayer);
+        // Deprecated! Clients should use `create_surface_from_layer` instead.
+        let is_actually_layer: BOOL = msg_send![view, isKindOfClass: class];
+        if is_actually_layer == YES {
+            return self.create_from_layer(view);
+        }
+
+        let use_current = if existing.is_null() {
+            false
+        } else {
+            let result: BOOL = msg_send![existing, isKindOfClass: class];
+            result == YES
+        };
+
+        let render_layer: CAMetalLayer = if use_current {
+            existing
+        } else {
+            let layer: CAMetalLayer = msg_send![class, new];
+            msg_send![view, setLayer: layer];
+            let bounds: CGRect = msg_send![view, bounds];
+            msg_send![layer, setBounds: bounds];
+
+            let window: cocoa::base::id = msg_send![view, window];
+            if !window.is_null() {
+                let scale_factor: CGFloat = msg_send![window, backingScaleFactor];
+                msg_send![layer, setContentsScale: scale_factor];
+            }
+            layer
+        };
+
+        msg_send![view, retain];
+        window::SurfaceInner::new(NonNull::new(view), render_layer)
     }
 
-    #[cfg(feature = "winit")]
-    pub fn create_surface(&self, window: &winit::Window) -> Surface {
-        use winit::os::ios::WindowExt;
-        self.create_surface_from_uiview(window.get_uiview())
+    unsafe fn create_from_layer(&self, layer: CAMetalLayer) -> window::SurfaceInner {
+        let class = class!(CAMetalLayer);
+        let proper_kind: BOOL = msg_send![layer, isKindOfClass: class];
+        assert_eq!(proper_kind, YES);
+        msg_send![layer, retain];
+        window::SurfaceInner::new(None, layer)
+    }
+
+    pub fn create_surface_from_layer(&self, layer: CAMetalLayer, enable_signposts: bool) -> Surface {
+        unsafe { self.create_from_layer(layer) }.into_surface(enable_signposts)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn create_surface_from_nsview(&self, nsview: *mut c_void, enable_signposts: bool) -> Surface {
+        unsafe { self.create_from_nsview(nsview) }.into_surface(enable_signposts)
+    }
+
+    #[cfg(target_os = "ios")]
+    pub fn create_surface_from_uiview(&self, uiview: *mut c_void, enable_signposts: bool) -> Surface {
+        unsafe { self.create_from_uiview(uiview) }.into_surface(enable_signposts)
     }
 }
 
@@ -347,6 +392,7 @@ impl hal::Backend for Backend {
 
     type Fence = native::Fence;
     type Semaphore = native::Semaphore;
+    type Event = ();
     type QueryPool = native::QueryPool;
 }
 
@@ -510,6 +556,8 @@ struct PrivateCapabilities {
     os_version: (u32, u32),
     msl_version: metal::MTLLanguageVersion,
     exposed_queues: usize,
+    // if TRUE, we'll report `NON_FILL_POLYGON_MODE` feature without the points support
+    expose_line_mode: bool,
     resource_heaps: bool,
     argument_buffers: bool,
     shared_textures: bool,
@@ -572,6 +620,8 @@ struct PrivateCapabilities {
     buffer_alignment: u64,
     max_buffer_size: u64,
     max_texture_size: u64,
+    max_texture_3d_size: u64,
+    max_texture_layers: u64,
 }
 
 impl PrivateCapabilities {
@@ -586,7 +636,7 @@ impl PrivateCapabilities {
             .any(|x| raw.supports_feature_set(x))
     }
 
-    fn new(device: &metal::Device) -> Self {
+    fn new(device: &metal::Device, experiments: &Experiments) -> Self {
         #[repr(C)]
         #[derive(Clone, Copy, Debug)]
         struct NSOperatingSystemVersion {
@@ -631,8 +681,10 @@ impl PrivateCapabilities {
                 MTLLanguageVersion::V1_0
             },
             exposed_queues: 1,
+            expose_line_mode: true,
             resource_heaps: Self::supports_any(&device, RESOURCE_HEAP_SUPPORT),
-            argument_buffers: Self::supports_any(&device, ARGUMENT_BUFFER_SUPPORT) && false, //TODO
+            argument_buffers: experiments.argument_buffers &&
+                Self::supports_any(&device, ARGUMENT_BUFFER_SUPPORT),
             shared_textures: !os_is_mac,
             base_instance: Self::supports_any(&device, BASE_INSTANCE_SUPPORT),
             dual_source_blending: Self::supports_any(&device, DUAL_SOURCE_BLEND_SUPPORT),
@@ -757,50 +809,37 @@ impl PrivateCapabilities {
                 ],
             ) && !os_is_mac,
             format_rgba32float_all: os_is_mac,
-            format_depth16unorm: Self::supports_any(
-                &device,
-                &[
-                    MTLFeatureSet::macOS_GPUFamily1_v2,
-                    MTLFeatureSet::macOS_GPUFamily1_v3,
-                ],
-            ),
-            format_depth32float_filter: Self::supports_any(
-                &device,
-                &[
-                    MTLFeatureSet::macOS_GPUFamily1_v1,
-                    MTLFeatureSet::macOS_GPUFamily1_v2,
-                    MTLFeatureSet::macOS_GPUFamily1_v3,
-                ],
-            ),
-            format_depth32float_none: !Self::supports_any(
-                &device,
-                &[
-                    MTLFeatureSet::macOS_GPUFamily1_v1,
-                    MTLFeatureSet::macOS_GPUFamily1_v2,
-                    MTLFeatureSet::macOS_GPUFamily1_v3,
-                ],
-            ),
+            format_depth16unorm: device.supports_feature_set(MTLFeatureSet::macOS_GPUFamily1_v2),
+            format_depth32float_filter: device.supports_feature_set(MTLFeatureSet::macOS_GPUFamily1_v1),
+            format_depth32float_none: !device.supports_feature_set(MTLFeatureSet::macOS_GPUFamily1_v1),
             format_bgr10a2_all: Self::supports_any(&device, BGR10A2_ALL),
-            format_bgr10a2_no_write: !Self::supports_any(
-                &device,
-                &[MTLFeatureSet::macOS_GPUFamily1_v3],
-            ),
+            format_bgr10a2_no_write: !device.supports_feature_set(MTLFeatureSet::macOS_GPUFamily1_v3),
             max_buffers_per_stage: 31,
             max_textures_per_stage: if os_is_mac { 128 } else { 31 },
             max_samplers_per_stage: 16,
             buffer_alignment: if os_is_mac { 256 } else { 64 },
-            max_buffer_size: if Self::supports_any(
-                &device,
-                &[
-                    MTLFeatureSet::macOS_GPUFamily1_v2,
-                    MTLFeatureSet::macOS_GPUFamily1_v3,
-                ],
-            ) {
+            max_buffer_size: if device.supports_feature_set(MTLFeatureSet::macOS_GPUFamily1_v2) {
                 1 << 30 // 1GB on macOS 1.2 and up
             } else {
                 1 << 28 // 256MB otherwise
             },
-            max_texture_size: 4096, //TODO
+            max_texture_size: if Self::supports_any(&device, &[
+                MTLFeatureSet::iOS_GPUFamily3_v1,
+                MTLFeatureSet::tvOS_GPUFamily2_v1,
+                MTLFeatureSet::macOS_GPUFamily1_v1,
+            ]) {
+                16384
+            } else if Self::supports_any(&device, &[
+                MTLFeatureSet::iOS_GPUFamily1_v2,
+                MTLFeatureSet::iOS_GPUFamily2_v2,
+                MTLFeatureSet::tvOS_GPUFamily1_v1,
+            ]) {
+                8192
+            } else {
+                4096
+            },
+            max_texture_3d_size: 2048,
+            max_texture_layers: 2048,
         }
     }
 
@@ -815,13 +854,6 @@ struct PrivateDisabilities {
     broken_viewport_near_depth: bool,
 }
 
-fn validate_line_width(width: f32) {
-    // Note from the Vulkan spec:
-    // > If the wide lines feature is not enabled, lineWidth must be 1.0
-    // Simply assert and no-op because Metal never exposes `Features::LINE_WIDTH`
-    assert_eq!(width, 1.0);
-}
-
 trait AsNative {
     type Native;
     fn from(native: &Self::Native) -> Self;
@@ -831,6 +863,9 @@ trait AsNative {
 pub type BufferPtr = NonNull<metal::MTLBuffer>;
 pub type TexturePtr = NonNull<metal::MTLTexture>;
 pub type SamplerPtr = NonNull<metal::MTLSamplerState>;
+pub type ResourcePtr = NonNull<metal::MTLResource>;
+
+//TODO: make this a generic struct with a single generic implementation
 
 impl AsNative for BufferPtr {
     type Native = metal::BufferRef;
@@ -865,5 +900,17 @@ impl AsNative for SamplerPtr {
     #[inline]
     fn as_native(&self) -> &metal::SamplerStateRef {
         unsafe { metal::SamplerStateRef::from_ptr(self.as_ptr()) }
+    }
+}
+
+impl AsNative for ResourcePtr {
+    type Native = metal::ResourceRef;
+    #[inline]
+    fn from(native: &metal::ResourceRef) -> Self {
+        unsafe { NonNull::new_unchecked(native.as_ptr()) }
+    }
+    #[inline]
+    fn as_native(&self) -> &metal::ResourceRef {
+        unsafe { metal::ResourceRef::from_ptr(self.as_ptr()) }
     }
 }

@@ -92,7 +92,7 @@ impl Harness {
     }
 
     fn run<I: hal::Instance>(&self, instance: I, _disabilities: Disabilities) -> usize {
-        use hal::PhysicalDevice;
+        use crate::hal::PhysicalDevice;
 
         let mut results = TestResults {
             pass: 0,
@@ -136,19 +136,19 @@ impl Harness {
                     );
                     results.skip += 1;
                 }
-                let mut max_compute_groups = [0; 3];
+                let mut max_compute_work_groups = [0; 3];
                 for job_name in &test.jobs {
                     if let warden::raw::Job::Compute { dispatch, .. } = tg.scene.jobs[job_name] {
-                        for (max, count) in max_compute_groups.iter_mut().zip(dispatch.iter()) {
+                        for (max, count) in max_compute_work_groups.iter_mut().zip(dispatch.iter()) {
                             *max = (*max).max(*count);
                         }
                     }
                 }
-                if max_compute_groups[0] > limits.max_compute_group_size[0]
-                    || max_compute_groups[1] > limits.max_compute_group_size[1]
-                    || max_compute_groups[2] > limits.max_compute_group_size[2]
+                if max_compute_work_groups[0] > limits.max_compute_work_group_size[0]
+                    || max_compute_work_groups[1] > limits.max_compute_work_group_size[1]
+                    || max_compute_work_groups[2] > limits.max_compute_work_group_size[2]
                 {
-                    println!("\tskipped (compute {:?})", max_compute_groups);
+                    println!("\tskipped (compute {:?})", max_compute_work_groups);
                     results.skip += 1;
                     continue;
                 }
@@ -224,12 +224,11 @@ fn main() {
         use gfx_backend_gl::glutin;
         println!("Warding GL:");
         let events_loop = glutin::EventsLoop::new();
-        let window = glutin::GlWindow::new(
-            glutin::WindowBuilder::new(),
-            glutin::ContextBuilder::new().with_gl_profile(glutin::GlProfile::Core),
-            &events_loop,
-        )
-        .unwrap();
+        let window = glutin::ContextBuilder::new()
+            .with_gl_profile(glutin::GlProfile::Core)
+            .build_windowed(glutin::WindowBuilder::new(), &events_loop)
+            .unwrap();
+        let window = unsafe { window.make_current() }.expect("Unable to make window current");
         let instance = gfx_backend_gl::Surface::from_window(window);
         num_failures += harness.run(instance, Disabilities::default());
     }
@@ -238,9 +237,11 @@ fn main() {
         use gfx_backend_gl::glutin;
         println!("Warding GL headless:");
         let events_loop = glutin::EventsLoop::new();
-        let context =
-            glutin::Context::new(&events_loop, glutin::ContextBuilder::new(), false).unwrap();
-        let instance = gfx_backend_gl::Headless(context);
+        let context = glutin::ContextBuilder::new()
+            .build_headless(&events_loop, glutin::dpi::PhysicalSize::new(0.0, 0.0))
+            .unwrap();
+        let context = unsafe { context.make_current() }.expect("Unable to make context current");
+        let instance = gfx_backend_gl::Headless::from_context(context);
         num_failures += harness.run(instance, Disabilities::default());
     }
     let _ = harness;

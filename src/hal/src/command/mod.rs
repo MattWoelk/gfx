@@ -13,8 +13,8 @@
 
 // TODO: Document pipelines and subpasses better.
 
-use queue::capability::{Capability, Supports};
-use Backend;
+use crate::queue::capability::{Capability, Supports};
+use crate::Backend;
 
 use std::borrow::Borrow;
 use std::marker::PhantomData;
@@ -37,10 +37,12 @@ pub use self::transfer::*;
 /// Trait indicating how many times a Submit object can be submitted to a command buffer.
 pub trait Shot {}
 /// Indicates a Submit that can only be submitted once.
+#[derive(Debug)]
 pub enum OneShot {}
 impl Shot for OneShot {}
 
 /// Indicates a Submit that can be submitted multiple times.
+#[derive(Debug)]
 pub enum MultiShot {}
 impl Shot for MultiShot {}
 
@@ -51,6 +53,7 @@ pub trait Level {}
 
 /// Vulkan describes a primary command buffer as one which can be directly submitted
 /// to a queue, and can execute `Secondary` command buffers.
+#[derive(Debug)]
 pub enum Primary {}
 impl Level for Primary {}
 
@@ -60,6 +63,7 @@ impl Level for Primary {}
 /// to a queue, but can be executed by a primary command buffer. This allows
 /// multiple secondary command buffers to be constructed which do specific
 /// things and can then be composed together into primary command buffers.
+#[derive(Debug)]
 pub enum Secondary {}
 impl Level for Secondary {}
 
@@ -71,6 +75,7 @@ pub type SecondaryCommandBuffer<B, C, S = OneShot> = CommandBuffer<B, C, S, Seco
 
 /// A strongly-typed command buffer that will only implement methods that are valid for the operations
 /// it supports.
+#[derive(Debug)]
 pub struct CommandBuffer<B: Backend, C, S = OneShot, L = Primary, R = <B as Backend>::CommandBuffer>
 {
     pub(crate) raw: R,
@@ -155,9 +160,20 @@ impl<B: Backend, C, S: Shot, L: Level> CommandBuffer<B, C, S, L> {
 
     /// Finish recording commands to the command buffers.
     ///
-    /// The command pool must be reset to able to re-record commands.
+    /// The command buffer must be reset to able to re-record commands.
     pub unsafe fn finish(&mut self) {
         self.raw.finish();
+    }
+
+    /// Empties the command buffer, optionally releasing all resources from the
+    /// commands that have been submitted. The command buffer is moved back to
+    /// the "initial" state.
+    ///
+    /// The command buffer must not be in the "pending" state. Additionally, the
+    /// command pool must have been created with the RESET_INDIVIDUAL flag to be
+    /// able to reset individual buffers.
+    pub unsafe fn reset(&mut self, release_resources: bool) {
+        self.raw.reset(release_resources);
     }
 
     /*

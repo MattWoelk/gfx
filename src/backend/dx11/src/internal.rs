@@ -76,7 +76,7 @@ const COPY_THREAD_GROUP_Y: u32 = 8;
 // TODO: make struct fields more modular and group them up in structs depending on if it is a
 //       fallback version or not (eg. Option<PartialClear>), should make struct definition and
 //       `new` function smaller
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Internal {
     // partial clearing
     vs_partial_clear: ComPtr<d3d11::ID3D11VertexShader>,
@@ -675,7 +675,7 @@ impl Internal {
         clear: command::ClearColor,
     ) {
         match clear {
-            command::ClearColor::Float(value) => {
+            command::ClearColor::Sfloat(value) => {
                 unsafe {
                     ptr::copy(
                         &PartialClearInfo {
@@ -697,7 +697,7 @@ impl Internal {
                     )
                 };
             }
-            command::ClearColor::Int(value) => {
+            command::ClearColor::Sint(value) => {
                 unsafe {
                     ptr::copy(
                         &PartialClearInfo {
@@ -898,6 +898,8 @@ impl Internal {
 
         let srv = src.internal.copy_srv.clone().unwrap().as_raw();
         let uav = dst.internal.uav.unwrap();
+        let format_desc = src.format.base_format().0.desc();
+        let bytes_per_texel  = format_desc.bits as u32 / 8;
 
         unsafe {
             context.CSSetShader(shader, ptr::null_mut(), 0);
@@ -923,6 +925,29 @@ impl Internal {
                         .max(1),
                     1,
                 );
+
+                if let Some(disjoint_cb) = dst.internal.disjoint_cb {
+                    let total_size = copy.image_extent.depth * (copy.buffer_height * copy.buffer_width * bytes_per_texel);
+                    let copy_box = d3d11::D3D11_BOX {
+                        left: copy.buffer_offset as u32,
+                        top: 0,
+                        front: 0,
+                        right: copy.buffer_offset as u32 + total_size,
+                        bottom: 1,
+                        back: 1,
+                    };
+
+                    context.CopySubresourceRegion(
+                        disjoint_cb as _,
+                        0,
+                        copy.buffer_offset as _,
+                        0,
+                        0,
+                        dst.internal.raw as _,
+                        0,
+                        &copy_box,
+                    );
+                }
             }
 
             // unbind external resources
@@ -1072,13 +1097,13 @@ impl Internal {
     }
 
     fn find_blit_shader(&self, src: &Image) -> Option<*mut d3d11::ID3D11PixelShader> {
-        use format::ChannelType::*;
+        use format::ChannelType as Ct;
 
         match src.format.base_format().1 {
-            Uint => Some(self.ps_blit_2d_uint.as_raw()),
-            Int => Some(self.ps_blit_2d_int.as_raw()),
-            Unorm | Inorm | Float | Srgb => Some(self.ps_blit_2d_float.as_raw()),
-            _ => None,
+            Ct::Uint => Some(self.ps_blit_2d_uint.as_raw()),
+            Ct::Sint => Some(self.ps_blit_2d_int.as_raw()),
+            Ct::Unorm | Ct::Snorm | Ct::Sfloat | Ct::Srgb => Some(self.ps_blit_2d_float.as_raw()),
+            Ct::Ufloat | Ct::Uscaled | Ct::Sscaled => None,
         }
     }
 
@@ -1209,7 +1234,7 @@ impl Internal {
                     }
 
                     match value {
-                        command::ClearColor::Float(_) => unsafe {
+                        command::ClearColor::Sfloat(_) => unsafe {
                             context.PSSetShader(
                                 self.ps_partial_clear_float.as_raw(),
                                 ptr::null_mut(),
@@ -1223,7 +1248,7 @@ impl Internal {
                                 0,
                             );
                         },
-                        command::ClearColor::Int(_) => unsafe {
+                        command::ClearColor::Sint(_) => unsafe {
                             context.PSSetShader(
                                 self.ps_partial_clear_int.as_raw(),
                                 ptr::null_mut(),

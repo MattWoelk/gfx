@@ -1,11 +1,12 @@
-use command::{self, Command, RawCommandBuffer};
-use hal::backend::FastHashMap;
-use hal::{self, pool};
-use native as n;
-use Backend;
+use crate::command::{self, Command, RawCommandBuffer};
+use crate::hal::backend::FastHashMap;
+use crate::hal::{self, pool};
+use crate::native as n;
+use crate::Backend;
 
 use std::sync::{Arc, Mutex};
 
+#[derive(Debug)]
 pub struct OwnedBuffer {
     pub(crate) commands: Vec<Command>,
     pub(crate) data: Vec<u8>,
@@ -27,6 +28,7 @@ impl OwnedBuffer {
 
 // Storage of command buffer memory.
 // Depends on the reset model chosen when creating the command pool.
+#[derive(Debug)]
 pub enum BufferMemory {
     // Storing all recorded commands and data in the pool in a linear
     // piece of memory shared by all associated command buffers.
@@ -51,6 +53,7 @@ pub enum BufferMemory {
     },
 }
 
+#[derive(Debug)]
 pub struct RawCommandPool {
     pub(crate) fbo: Option<n::FrameBuffer>,
     pub(crate) limits: command::Limits,
@@ -58,7 +61,7 @@ pub struct RawCommandPool {
 }
 
 impl pool::RawCommandPool<Backend> for RawCommandPool {
-    unsafe fn reset(&mut self) {
+    unsafe fn reset(&mut self, _release_resources: bool) {
         let mut memory = self
             .memory
             .try_lock()

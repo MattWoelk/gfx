@@ -5,15 +5,17 @@ use std::mem;
 
 use winapi::shared::basetsd::UINT8;
 use winapi::shared::dxgiformat::*;
-use winapi::shared::minwindef::{FALSE, INT, TRUE};
+use winapi::shared::minwindef::{FALSE, INT, UINT, TRUE};
 use winapi::um::d3d12::*;
 use winapi::um::d3dcommon::*;
 
-use hal::format::{Format, ImageFeature, SurfaceType};
+use hal::format::{Format, ImageFeature, SurfaceType, Swizzle};
 use hal::pso::DescriptorSetLayoutBinding;
 use hal::{buffer, image, pso, Primitive};
 
 use native::descriptor::{Binding, DescriptorRange, DescriptorRangeType};
+
+
 pub fn map_format(format: Format) -> Option<DXGI_FORMAT> {
     use hal::format::Format::*;
 
@@ -26,61 +28,61 @@ pub fn map_format(format: Format) -> Option<DXGI_FORMAT> {
         B5g5r5a1Unorm if !reverse => DXGI_FORMAT_B5G5R5A1_UNORM,
         A1r5g5b5Unorm if reverse => DXGI_FORMAT_B5G5R5A1_UNORM,
         R8Unorm => DXGI_FORMAT_R8_UNORM,
-        R8Inorm => DXGI_FORMAT_R8_SNORM,
+        R8Snorm => DXGI_FORMAT_R8_SNORM,
         R8Uint => DXGI_FORMAT_R8_UINT,
-        R8Int => DXGI_FORMAT_R8_SINT,
+        R8Sint => DXGI_FORMAT_R8_SINT,
         Rg8Unorm => DXGI_FORMAT_R8G8_UNORM,
-        Rg8Inorm => DXGI_FORMAT_R8G8_SNORM,
+        Rg8Snorm => DXGI_FORMAT_R8G8_SNORM,
         Rg8Uint => DXGI_FORMAT_R8G8_UINT,
-        Rg8Int => DXGI_FORMAT_R8G8_SINT,
+        Rg8Sint => DXGI_FORMAT_R8G8_SINT,
         Rgba8Unorm => DXGI_FORMAT_R8G8B8A8_UNORM,
-        Rgba8Inorm => DXGI_FORMAT_R8G8B8A8_SNORM,
+        Rgba8Snorm => DXGI_FORMAT_R8G8B8A8_SNORM,
         Rgba8Uint => DXGI_FORMAT_R8G8B8A8_UINT,
-        Rgba8Int => DXGI_FORMAT_R8G8B8A8_SINT,
+        Rgba8Sint => DXGI_FORMAT_R8G8B8A8_SINT,
         Rgba8Srgb => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
         Bgra8Unorm => DXGI_FORMAT_B8G8R8A8_UNORM,
         Bgra8Srgb => DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
         Abgr8Unorm if reverse => DXGI_FORMAT_R8G8B8A8_UNORM,
-        Abgr8Inorm if reverse => DXGI_FORMAT_R8G8B8A8_SNORM,
+        Abgr8Snorm if reverse => DXGI_FORMAT_R8G8B8A8_SNORM,
         Abgr8Uint if reverse => DXGI_FORMAT_R8G8B8A8_UINT,
-        Abgr8Int if reverse => DXGI_FORMAT_R8G8B8A8_SINT,
+        Abgr8Sint if reverse => DXGI_FORMAT_R8G8B8A8_SINT,
         Abgr8Srgb if reverse => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
         A2b10g10r10Unorm if reverse => DXGI_FORMAT_R10G10B10A2_UNORM,
         A2b10g10r10Uint if reverse => DXGI_FORMAT_R10G10B10A2_UINT,
         R16Unorm => DXGI_FORMAT_R16_UNORM,
-        R16Inorm => DXGI_FORMAT_R16_SNORM,
+        R16Snorm => DXGI_FORMAT_R16_SNORM,
         R16Uint => DXGI_FORMAT_R16_UINT,
-        R16Int => DXGI_FORMAT_R16_SINT,
-        R16Float => DXGI_FORMAT_R16_FLOAT,
+        R16Sint => DXGI_FORMAT_R16_SINT,
+        R16Sfloat => DXGI_FORMAT_R16_FLOAT,
         Rg16Unorm => DXGI_FORMAT_R16G16_UNORM,
-        Rg16Inorm => DXGI_FORMAT_R16G16_SNORM,
+        Rg16Snorm => DXGI_FORMAT_R16G16_SNORM,
         Rg16Uint => DXGI_FORMAT_R16G16_UINT,
-        Rg16Int => DXGI_FORMAT_R16G16_SINT,
-        Rg16Float => DXGI_FORMAT_R16G16_FLOAT,
+        Rg16Sint => DXGI_FORMAT_R16G16_SINT,
+        Rg16Sfloat => DXGI_FORMAT_R16G16_FLOAT,
         Rgba16Unorm => DXGI_FORMAT_R16G16B16A16_UNORM,
-        Rgba16Inorm => DXGI_FORMAT_R16G16B16A16_SNORM,
+        Rgba16Snorm => DXGI_FORMAT_R16G16B16A16_SNORM,
         Rgba16Uint => DXGI_FORMAT_R16G16B16A16_UINT,
-        Rgba16Int => DXGI_FORMAT_R16G16B16A16_SINT,
-        Rgba16Float => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        Rgba16Sint => DXGI_FORMAT_R16G16B16A16_SINT,
+        Rgba16Sfloat => DXGI_FORMAT_R16G16B16A16_FLOAT,
         R32Uint => DXGI_FORMAT_R32_UINT,
-        R32Int => DXGI_FORMAT_R32_SINT,
-        R32Float => DXGI_FORMAT_R32_FLOAT,
+        R32Sint => DXGI_FORMAT_R32_SINT,
+        R32Sfloat => DXGI_FORMAT_R32_FLOAT,
         Rg32Uint => DXGI_FORMAT_R32G32_UINT,
-        Rg32Int => DXGI_FORMAT_R32G32_SINT,
-        Rg32Float => DXGI_FORMAT_R32G32_FLOAT,
+        Rg32Sint => DXGI_FORMAT_R32G32_SINT,
+        Rg32Sfloat => DXGI_FORMAT_R32G32_FLOAT,
         Rgb32Uint => DXGI_FORMAT_R32G32B32_UINT,
-        Rgb32Int => DXGI_FORMAT_R32G32B32_SINT,
-        Rgb32Float => DXGI_FORMAT_R32G32B32_FLOAT,
+        Rgb32Sint => DXGI_FORMAT_R32G32B32_SINT,
+        Rgb32Sfloat => DXGI_FORMAT_R32G32B32_FLOAT,
         Rgba32Uint => DXGI_FORMAT_R32G32B32A32_UINT,
-        Rgba32Int => DXGI_FORMAT_R32G32B32A32_SINT,
-        Rgba32Float => DXGI_FORMAT_R32G32B32A32_FLOAT,
+        Rgba32Sint => DXGI_FORMAT_R32G32B32A32_SINT,
+        Rgba32Sfloat => DXGI_FORMAT_R32G32B32A32_FLOAT,
         B10g11r11Ufloat if reverse => DXGI_FORMAT_R11G11B10_FLOAT,
         E5b9g9r9Ufloat if reverse => DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
         D16Unorm => DXGI_FORMAT_D16_UNORM,
         D24UnormS8Uint => DXGI_FORMAT_D24_UNORM_S8_UINT,
         X8D24Unorm if reverse => DXGI_FORMAT_D24_UNORM_S8_UINT,
-        D32Float => DXGI_FORMAT_D32_FLOAT,
-        D32FloatS8Uint => DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+        D32Sfloat => DXGI_FORMAT_D32_FLOAT,
+        D32SfloatS8Uint => DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
         Bc1RgbUnorm => DXGI_FORMAT_BC1_UNORM,
         Bc1RgbSrgb => DXGI_FORMAT_BC1_UNORM_SRGB,
         Bc2Unorm => DXGI_FORMAT_BC2_UNORM,
@@ -88,11 +90,11 @@ pub fn map_format(format: Format) -> Option<DXGI_FORMAT> {
         Bc3Unorm => DXGI_FORMAT_BC3_UNORM,
         Bc3Srgb => DXGI_FORMAT_BC3_UNORM_SRGB,
         Bc4Unorm => DXGI_FORMAT_BC4_UNORM,
-        Bc4Inorm => DXGI_FORMAT_BC4_SNORM,
+        Bc4Snorm => DXGI_FORMAT_BC4_SNORM,
         Bc5Unorm => DXGI_FORMAT_BC5_UNORM,
-        Bc5Inorm => DXGI_FORMAT_BC5_SNORM,
+        Bc5Snorm => DXGI_FORMAT_BC5_SNORM,
         Bc6hUfloat => DXGI_FORMAT_BC6H_UF16,
-        Bc6hFloat => DXGI_FORMAT_BC6H_SF16,
+        Bc6hSfloat => DXGI_FORMAT_BC6H_SF16,
         Bc7Unorm => DXGI_FORMAT_BC7_UNORM,
         Bc7Srgb => DXGI_FORMAT_BC7_UNORM_SRGB,
 
@@ -100,6 +102,56 @@ pub fn map_format(format: Format) -> Option<DXGI_FORMAT> {
     };
 
     Some(format)
+}
+
+pub fn map_swizzle(swizzle: Swizzle) -> UINT {
+    use hal::format::Component::*;
+
+    [swizzle.0, swizzle.1, swizzle.2, swizzle.3]
+        .iter()
+        .enumerate()
+        .fold(D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES, |mapping, (i, &component)| {
+            let value = match component {
+                R => D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0,
+                G => D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_1,
+                B => D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_2,
+                A => D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_3,
+                Zero => D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0,
+                One => D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1,
+            };
+            mapping | (value << D3D12_SHADER_COMPONENT_MAPPING_SHIFT as usize * i)
+        })
+}
+
+pub fn map_surface_type(st: SurfaceType) -> Option<DXGI_FORMAT> {
+    use hal::format::SurfaceType::*;
+
+    assert_eq!(1, unsafe {*(&1u32 as *const _ as *const u8)});
+    Some(match st {
+        R5_G6_B5 => DXGI_FORMAT_B5G6R5_UNORM,
+        A1_R5_G5_B5 => DXGI_FORMAT_B5G5R5A1_UNORM,
+        R8 => DXGI_FORMAT_R8_TYPELESS,
+        R8_G8 => DXGI_FORMAT_R8G8_TYPELESS,
+        R8_G8_B8_A8 => DXGI_FORMAT_R8G8B8A8_TYPELESS,
+        B8_G8_R8_A8 => DXGI_FORMAT_B8G8R8A8_TYPELESS,
+        A8_B8_G8_R8 => DXGI_FORMAT_R8G8B8A8_TYPELESS,
+        A2_B10_G10_R10 => DXGI_FORMAT_R10G10B10A2_TYPELESS,
+        R16 => DXGI_FORMAT_R16_TYPELESS,
+        R16_G16 => DXGI_FORMAT_R16G16_TYPELESS,
+        R16_G16_B16_A16 => DXGI_FORMAT_R16G16B16A16_TYPELESS,
+        R32 => DXGI_FORMAT_R32_TYPELESS,
+        R32_G32 => DXGI_FORMAT_R32G32_TYPELESS,
+        R32_G32_B32 => DXGI_FORMAT_R32G32B32_TYPELESS,
+        R32_G32_B32_A32 => DXGI_FORMAT_R32G32B32A32_TYPELESS,
+        B10_G11_R11 => DXGI_FORMAT_R11G11B10_FLOAT,
+        E5_B9_G9_R9 => DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+        D16 => DXGI_FORMAT_R16_TYPELESS,
+        X8D24 => DXGI_FORMAT_D24_UNORM_S8_UINT,
+        D32 => DXGI_FORMAT_R32_TYPELESS,
+        D24_S8 => DXGI_FORMAT_D24_UNORM_S8_UINT,
+        D32_S8 => DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+        _ => return None
+    })
 }
 
 pub fn map_format_dsv(surface: SurfaceType) -> Option<DXGI_FORMAT> {

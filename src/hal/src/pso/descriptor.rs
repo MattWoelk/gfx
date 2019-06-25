@@ -20,10 +20,10 @@ use std::borrow::Borrow;
 use std::fmt;
 use std::ops::Range;
 
-use buffer::Offset;
-use image::Layout;
-use pso::ShaderStageFlags;
-use Backend;
+use crate::buffer::Offset;
+use crate::image::Layout;
+use crate::pso::ShaderStageFlags;
+use crate::Backend;
 
 ///
 pub type DescriptorSetIndex = u16;
@@ -200,6 +200,7 @@ pub trait DescriptorPool<B: Backend>: Send + Sync + fmt::Debug {
 /// Writes the actual descriptors to be bound into a descriptor set. Should be provided
 /// to the `write_descriptor_sets` method of a `Device`.
 #[allow(missing_docs)]
+#[derive(Debug)]
 pub struct DescriptorSetWrite<'a, B: Backend, WI>
 where
     WI: IntoIterator,
@@ -220,7 +221,7 @@ where
 ///
 /// [`DescriptorSetWrite`]: struct.DescriptorSetWrite.html
 #[allow(missing_docs)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Descriptor<'a, B: Backend> {
     Sampler(&'a B::Sampler),
     Image(&'a B::ImageView, Layout),
@@ -233,7 +234,7 @@ pub enum Descriptor<'a, B: Backend> {
 /// Copies a range of descriptors to be bound from one descriptor set to another Should be
 /// provided to the `copy_descriptor_sets` method of a `Device`.
 #[allow(missing_docs)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct DescriptorSetCopy<'a, B: Backend> {
     pub src_set: &'a B::DescriptorSet,
     pub src_binding: DescriptorBinding,
@@ -242,4 +243,13 @@ pub struct DescriptorSetCopy<'a, B: Backend> {
     pub dst_binding: DescriptorBinding,
     pub dst_array_offset: DescriptorArrayIndex,
     pub count: usize,
+}
+
+bitflags! {
+    /// Descriptor pool creation flags.
+    pub struct DescriptorPoolCreateFlags: u32 {
+        /// Specifies that descriptor sets are allowed to be freed from the pool
+        /// individually.
+        const FREE_DESCRIPTOR_SET = 0x1;
+    }
 }

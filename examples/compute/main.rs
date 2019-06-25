@@ -1,9 +1,11 @@
 #![cfg_attr(
-    not(any(feature = "vulkan", feature = "dx12", feature = "metal")),
+    not(any(feature = "vulkan", feature = "dx11", feature = "dx12", feature = "metal")),
     allow(dead_code, unused_extern_crates, unused_imports)
 )]
 
 extern crate env_logger;
+#[cfg(feature = "dx11")]
+extern crate gfx_backend_dx11 as back;
 #[cfg(feature = "dx12")]
 extern crate gfx_backend_dx12 as back;
 #[cfg(feature = "metal")]
@@ -20,9 +22,8 @@ use hal::{Backend, Compute, DescriptorPool, Device, Instance, PhysicalDevice, Qu
 extern crate glsl_to_spirv;
 
 use std::fs;
-use std::io::Read;
 
-#[cfg(any(feature = "vulkan", feature = "dx12", feature = "metal"))]
+#[cfg(any(feature = "vulkan", feature = "dx11", feature = "dx12", feature = "metal"))]
 fn main() {
     env_logger::init();
 
@@ -52,11 +53,9 @@ fn main() {
     let (device, mut queue_group) = adapter.open_with::<_, Compute>(1, |_family| true).unwrap();
 
     let glsl = fs::read_to_string("compute/shader/collatz.comp").unwrap();
-    let spirv: Vec<u8> = glsl_to_spirv::compile(&glsl, glsl_to_spirv::ShaderType::Compute)
-        .unwrap()
-        .bytes()
-        .map(|b| b.unwrap())
-        .collect();
+    let file = glsl_to_spirv::compile(&glsl, glsl_to_spirv::ShaderType::Compute)
+        .unwrap();
+    let spirv: Vec<u32> = hal::read_spirv(file).unwrap();
     let shader = unsafe { device.create_shader_module(&spirv) }.unwrap();
 
     let (pipeline_layout, pipeline, set_layout, mut desc_pool) = {
@@ -96,6 +95,7 @@ fn main() {
                     ty: pso::DescriptorType::StorageBuffer,
                     count: 1,
                 }],
+                pso::DescriptorPoolCreateFlags::empty(),
             )
         }
         .expect("Can't create descriptor pool");
@@ -199,7 +199,7 @@ fn main() {
         );
         command_buffer.finish();
 
-        queue_group.queues[0].submit_nosemaphores(Some(&command_buffer), Some(&fence));
+        queue_group.queues[0].submit_without_semaphores(Some(&command_buffer), Some(&fence));
 
         device.wait_for_fence(&fence, !0).unwrap();
         command_pool.free(Some(command_buffer));
@@ -260,7 +260,7 @@ unsafe fn create_buffer<B: Backend>(
     (memory, buffer, requirements.size)
 }
 
-#[cfg(not(any(feature = "vulkan", feature = "dx12", feature = "metal")))]
+#[cfg(not(any(feature = "vulkan", feature = "dx11", feature = "dx12", feature = "metal")))]
 fn main() {
     println!("You need to enable one of the next-gen API feature (vulkan, dx12, metal) to run this example.");
 }

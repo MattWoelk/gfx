@@ -1,13 +1,14 @@
 //! Command pools
 
-use command::{
+use crate::command::{
     CommandBuffer, IntoRawCommandBuffer, RawLevel, SecondaryCommandBuffer, Shot,
     SubpassCommandBuffer,
 };
-use queue::capability::{Graphics, Supports};
-use Backend;
+use crate::queue::capability::{Graphics, Supports};
+use crate::Backend;
 
 use std::any::Any;
+use std::fmt;
 use std::marker::PhantomData;
 
 bitflags!(
@@ -23,11 +24,11 @@ bitflags!(
 );
 
 /// The allocated command buffers are associated with the creating command queue.
-pub trait RawCommandPool<B: Backend>: Any + Send + Sync {
+pub trait RawCommandPool<B: Backend>: fmt::Debug + Any + Send + Sync {
     /// Reset the command pool and the corresponding command buffers.
     ///
     /// # Synchronization: You may _not_ free the pool if a command buffer is still in use (pool memory still in use)
-    unsafe fn reset(&mut self);
+    unsafe fn reset(&mut self, release_resources: bool);
 
     /// Allocate a single command buffers from the pool.
     fn allocate_one(&mut self, level: RawLevel) -> B::CommandBuffer {
@@ -46,6 +47,12 @@ pub trait RawCommandPool<B: Backend>: Any + Send + Sync {
 }
 
 /// Strong-typed command pool.
+///
+/// This a safer wrapper around `RawCommandPool` which ensures that only **one**
+/// command buffer is recorded at the same time from the current queue.
+/// Command buffers are stored internally and can only be obtained via a strong-typed
+/// `CommandBuffer` wrapper for encoding.
+#[derive(Debug)]
 pub struct CommandPool<B: Backend, C> {
     raw: B::CommandPool,
     _capability: PhantomData<C>,
@@ -69,8 +76,8 @@ impl<B: Backend, C> CommandPool<B, C> {
     /// Reset the command pool and the corresponding command buffers.
     ///
     /// # Synchronization: You may _not_ free the pool if a command buffer is still in use (pool memory still in use)
-    pub unsafe fn reset(&mut self) {
-        self.raw.reset();
+    pub unsafe fn reset(&mut self, release_resources: bool) {
+        self.raw.reset(release_resources);
     }
 
     /// Allocates a new primary command buffer from the pool.
@@ -103,7 +110,7 @@ impl<B: Backend, C> CommandPool<B, C> {
 
 impl<B: Backend, C: Supports<Graphics>> CommandPool<B, C> {
     /// Allocates a new subpass command buffer from the pool.
-    pub fn acquire_subpass_command_buffer<'a, S: Shot>(&mut self) -> SubpassCommandBuffer<B, S> {
+    pub fn acquire_subpass_command_buffer<S: Shot>(&mut self) -> SubpassCommandBuffer<B, S> {
         let buffer = self.raw.allocate_one(RawLevel::Secondary);
         unsafe { SubpassCommandBuffer::new(buffer) }
     }

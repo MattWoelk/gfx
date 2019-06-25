@@ -33,14 +33,16 @@ else
 		EXCLUDES+= --exclude gfx-backend-metal
 		FEATURES_HAL=vulkan
 	endif
-	ifeq ($(UNAME_S),Darwin)
+	ifeq ($(TARGET),aarch64-apple-ios)
 		EXCLUDES+= --exclude gfx-backend-vulkan
+	endif
+	ifeq ($(UNAME_S),Darwin)
 		FEATURES_HAL=metal
 	endif
 endif
 
 
-.PHONY: all check quad test doc reftests travis-sdl2
+.PHONY: all check quad quad-wasm test doc reftests travis-sdl2
 
 all: check test
 
@@ -71,6 +73,9 @@ reftests-ci:
 
 quad:
 	cd examples && cargo run --bin quad --features ${FEATURES_HAL}
+
+quad-wasm:
+	cd examples && cargo +nightly build --target wasm32-unknown-unknown --features gl --bin quad && wasm-bindgen ../target/wasm32-unknown-unknown/debug/quad.wasm --out-dir ../examples/generated-wasm --web
 
 travis-sdl2:
 	#TODO

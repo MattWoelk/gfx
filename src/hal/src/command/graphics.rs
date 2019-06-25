@@ -6,9 +6,9 @@ use super::{
     ClearColorRaw, ClearDepthStencilRaw, ClearValueRaw, CommandBuffer, DescriptorSetOffset, Level,
     Primary, RawCommandBuffer, RenderPassInlineEncoder, RenderPassSecondaryEncoder, Shot,
 };
-use queue::capability::{Graphics, GraphicsOrCompute, Supports};
-use Backend;
-use {buffer, image, pso, query};
+use crate::queue::capability::{Graphics, GraphicsOrCompute, Supports};
+use crate::Backend;
+use crate::{buffer, image, pso, query};
 
 /// A universal clear color supporting integer formats
 /// as well as the standard floating-point.
@@ -16,9 +16,9 @@ use {buffer, image, pso, query};
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum ClearColor {
     /// Standard floating-point `vec4` color
-    Float(pso::ColorValue),
+    Sfloat(pso::ColorValue),
     /// Integer vector to clear `ivec4` targets.
-    Int([i32; 4]),
+    Sint([i32; 4]),
     /// Unsigned int vector to clear `uvec4` targets.
     Uint([u32; 4]),
 }
@@ -36,12 +36,12 @@ macro_rules! impl_clear {
 }
 
 impl_clear! {
-    [f32; 4] = Float[0, 1, 2, 3],
-    [f32; 3] = Float[0, 1, 2, 0],
-    [f32; 2] = Float[0, 1, 0, 0],
-    [i32; 4] = Int  [0, 1, 2, 3],
-    [i32; 3] = Int  [0, 1, 2, 0],
-    [i32; 2] = Int  [0, 1, 0, 0],
+    [f32; 4] = Sfloat[0, 1, 2, 3],
+    [f32; 3] = Sfloat[0, 1, 2, 0],
+    [f32; 2] = Sfloat[0, 1, 0, 0],
+    [i32; 4] = Sint  [0, 1, 2, 3],
+    [i32; 3] = Sint  [0, 1, 2, 0],
+    [i32; 2] = Sint  [0, 1, 0, 0],
     [u32; 4] = Uint [0, 1, 2, 3],
     [u32; 3] = Uint [0, 1, 2, 0],
     [u32; 2] = Uint [0, 1, 0, 0],
@@ -49,12 +49,12 @@ impl_clear! {
 
 impl From<f32> for ClearColor {
     fn from(v: f32) -> Self {
-        ClearColor::Float([v, 0.0, 0.0, 0.0])
+        ClearColor::Sfloat([v, 0.0, 0.0, 0.0])
     }
 }
 impl From<i32> for ClearColor {
     fn from(v: i32) -> Self {
-        ClearColor::Int([v, 0, 0, 0])
+        ClearColor::Sint([v, 0, 0, 0])
     }
 }
 impl From<u32> for ClearColor {
@@ -66,8 +66,8 @@ impl From<u32> for ClearColor {
 impl From<ClearColor> for ClearColorRaw {
     fn from(cv: ClearColor) -> Self {
         match cv {
-            ClearColor::Float(cv) => ClearColorRaw { float32: cv },
-            ClearColor::Int(cv) => ClearColorRaw { int32: cv },
+            ClearColor::Sfloat(cv) => ClearColorRaw { float32: cv },
+            ClearColor::Sint(cv) => ClearColorRaw { int32: cv },
             ClearColor::Uint(cv) => ClearColorRaw { uint32: cv },
         }
     }
@@ -191,7 +191,7 @@ impl<B: Backend, C: Supports<Graphics>, S: Shot, L: Level> CommandBuffer<B, C, S
     }
 
     /// Identical to the `RawCommandBuffer` method of the same name.
-    pub unsafe fn bind_vertex_buffers<I, T>(&mut self, first_binding: u32, buffers: I)
+    pub unsafe fn bind_vertex_buffers<I, T>(&mut self, first_binding: pso::BufferIndex, buffers: I)
     where
         I: IntoIterator<Item = (T, buffer::Offset)>,
         T: Borrow<B::Buffer>,

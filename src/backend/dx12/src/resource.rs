@@ -17,7 +17,7 @@ use std::ops::Range;
 #[derive(Debug, Hash)]
 pub enum ShaderModule {
     Compiled(BTreeMap<String, native::Blob>),
-    Spirv(Vec<u8>),
+    Spirv(Vec<u32>),
 }
 unsafe impl Send for ShaderModule {}
 unsafe impl Sync for ShaderModule {}
@@ -220,6 +220,7 @@ pub struct ImageBound {
     pub(crate) surface_type: format::SurfaceType,
     pub(crate) kind: image::Kind,
     pub(crate) usage: image::Usage,
+    pub(crate) default_view_format: Option<DXGI_FORMAT>,
     pub(crate) view_caps: image::ViewCapabilities,
     #[derivative(Debug = "ignore")]
     pub(crate) descriptor: d3d12::D3D12_RESOURCE_DESC,
@@ -260,7 +261,8 @@ impl ImageBound {
 pub struct ImageUnbound {
     #[derivative(Debug = "ignore")]
     pub(crate) desc: d3d12::D3D12_RESOURCE_DESC,
-    pub(crate) dsv_format: DXGI_FORMAT,
+    pub(crate) view_format: Option<DXGI_FORMAT>,
+    pub(crate) dsv_format: Option<DXGI_FORMAT>,
     pub(crate) requirements: memory::Requirements,
     pub(crate) format: format::Format,
     pub(crate) kind: image::Kind,

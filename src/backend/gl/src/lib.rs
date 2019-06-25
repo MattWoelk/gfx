@@ -7,12 +7,9 @@
 extern crate bitflags;
 #[macro_use]
 extern crate log;
-extern crate gfx_gl as gl;
 extern crate gfx_hal as hal;
-#[cfg(feature = "glutin")]
+#[cfg(all(not(target_arch = "wasm32"), feature = "glutin"))]
 pub extern crate glutin;
-extern crate smallvec;
-extern crate spirv_cross;
 
 use std::cell::Cell;
 use std::fmt;
@@ -20,8 +17,8 @@ use std::ops::Deref;
 use std::sync::{Arc, Weak};
 use std::thread::{self, ThreadId};
 
-use hal::queue::{QueueFamilyId, Queues};
-use hal::{error, image, pso};
+use crate::hal::queue::{QueueFamilyId, Queues};
+use crate::hal::{error, image, pso, buffer, memory};
 
 pub use self::device::Device;
 pub use self::info::{Info, PlatformName, Version};
@@ -36,23 +33,73 @@ mod queue;
 mod state;
 mod window;
 
-#[cfg(feature = "glutin")]
-pub use window::glutin::{config_context, Headless, Surface, Swapchain};
+#[cfg(all(not(target_arch = "wasm32"), feature = "glutin"))]
+pub use crate::window::glutin::{config_context, Headless, Surface, Swapchain};
+#[cfg(target_arch = "wasm32")]
+pub use crate::window::web::{Surface, Swapchain, Window};
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "glutin"))]
+pub use glow::native::Context as GlContext;
+#[cfg(target_arch = "wasm32")]
+pub use glow::web::Context as GlContext;
+use glow::Context;
 
 pub(crate) struct GlContainer {
-    context: gl::Gl,
+    context: GlContext,
 }
 
 impl GlContainer {
     fn make_current(&self) {
         // Unimplemented
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn from_fn_proc<F>(fn_proc: F) -> GlContainer
+    where F: FnMut(&str) -> *const std::os::raw::c_void {
+        let context = glow::native::Context::from_loader_function(fn_proc);
+        GlContainer { context }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn from_new_canvas() -> GlContainer {
+        let context = {
+            use wasm_bindgen::JsCast;
+            let document = web_sys::window()
+                .and_then(|win| win.document())
+                .expect("Cannot get document");
+            let canvas = document
+                .create_element("canvas")
+                .expect("Cannot create canvas")
+                .dyn_into::<web_sys::HtmlCanvasElement>()
+                .expect("Cannot get canvas element");
+            // TODO: Remove hardcoded width/height
+            canvas.set_attribute("width", "640").expect("Cannot set width");
+            canvas.set_attribute("height", "480").expect("Cannot set height");
+            let context_options = js_sys::Object::new();
+            js_sys::Reflect::set(
+                &context_options,
+                &"antialias".into(),
+                &wasm_bindgen::JsValue::FALSE
+            ).expect("Cannot create context options");
+            let webgl2_context = canvas
+                .get_context_with_context_options("webgl2", &context_options)
+                .expect("Cannot create WebGL2 context")
+                .and_then(|context| context.dyn_into::<web_sys::WebGl2RenderingContext>().ok())
+                .expect("Cannot convert into WebGL2 context");
+            document.body()
+                .expect("Cannot get document body")
+                .append_child(&canvas)
+                .expect("Cannot insert canvas into document body");
+            glow::web::Context::from_webgl2_context(webgl2_context)
+        };
+        GlContainer { context }
+    }
 }
 
 impl Deref for GlContainer {
-    type Target = gl::Gl;
-    fn deref(&self) -> &gl::Gl {
-        #[cfg(feature = "glutin")]
+    type Target = GlContext;
+    fn deref(&self) -> &GlContext {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "glutin"))]
         self.make_current();
         &self.context
     }
@@ -76,7 +123,7 @@ impl hal::Backend for Backend {
 
     type ShaderModule = native::ShaderModule;
     type RenderPass = native::RenderPass;
-    type Framebuffer = native::FrameBuffer;
+    type Framebuffer = Option<native::FrameBuffer>;
 
     type Buffer = native::Buffer;
     type BufferView = native::BufferView;
@@ -94,6 +141,7 @@ impl hal::Backend for Backend {
 
     type Fence = native::Fence;
     type Semaphore = native::Semaphore;
+    type Event = ();
     type QueryPool = ();
 }
 
@@ -109,17 +157,28 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn from_error_code(error_code: gl::types::GLenum) -> Error {
+    pub fn from_error_code(error_code: u32) -> Error {
         match error_code {
-            gl::NO_ERROR => Error::NoError,
-            gl::INVALID_ENUM => Error::InvalidEnum,
-            gl::INVALID_VALUE => Error::InvalidValue,
-            gl::INVALID_OPERATION => Error::InvalidOperation,
-            gl::INVALID_FRAMEBUFFER_OPERATION => Error::InvalidFramebufferOperation,
-            gl::OUT_OF_MEMORY => Error::OutOfMemory,
+            glow::NO_ERROR => Error::NoError,
+            glow::INVALID_ENUM => Error::InvalidEnum,
+            glow::INVALID_VALUE => Error::InvalidValue,
+            glow::INVALID_OPERATION => Error::InvalidOperation,
+            glow::INVALID_FRAMEBUFFER_OPERATION => Error::InvalidFramebufferOperation,
+            glow::OUT_OF_MEMORY => Error::OutOfMemory,
             _ => Error::UnknownError,
         }
     }
+}
+
+const DEVICE_LOCAL_HEAP: usize = 0;
+const CPU_VISIBLE_HEAP: usize = 1;
+
+/// Memory types in the OpenGL backend are either usable for buffers and are backed by a real OpenGL
+/// buffer, or are used for images and are fake and not backed by any real raw buffer.
+#[derive(Copy, Clone)]
+enum MemoryUsage {
+    Buffer(buffer::Usage),
+    Image,
 }
 
 /// Internal struct of shared data between the physical and logical device.
@@ -132,6 +191,7 @@ struct Share {
     private_caps: info::PrivateCaps,
     // Indicates if there is an active logical device.
     open: Cell<bool>,
+    memory_types: Vec<(hal::MemoryType, MemoryUsage)>,
 }
 
 impl Share {
@@ -139,12 +199,44 @@ impl Share {
     fn check(&self) -> Result<(), Error> {
         if cfg!(debug_assertions) {
             let gl = &self.context;
-            let err = Error::from_error_code(unsafe { gl.GetError() });
+            let err = Error::from_error_code(unsafe { gl.get_error() });
             if err != Error::NoError {
                 return Err(err);
             }
         }
         Ok(())
+    }
+
+    fn buffer_memory_type_mask(&self, usage: buffer::Usage) -> u64 {
+        let mut type_mask = 0;
+        for (type_index, &(_, kind)) in self.memory_types.iter().enumerate() {
+            match kind {
+                MemoryUsage::Buffer(buffer_usage) => {
+                    if buffer_usage.contains(usage) {
+                        type_mask |= 1 << type_index;
+                    }
+                }
+                MemoryUsage::Image => {},
+            }
+        }
+        if type_mask == 0 {
+            error!("gl backend capability does not allow a buffer with usage {:?}", usage);
+        }
+        type_mask
+    }
+
+    fn image_memory_type_mask(&self) -> u64 {
+        let mut type_mask = 0;
+        for (type_index, &(_, kind)) in self.memory_types.iter().enumerate() {
+            match kind {
+                MemoryUsage::Buffer(_) => {},
+                MemoryUsage::Image => {
+                    type_mask |= 1 << type_index;
+                },
+            }
+        }
+        assert_ne!(type_mask, 0);
+        type_mask
     }
 }
 
@@ -235,14 +327,8 @@ unsafe impl<T: ?Sized> Sync for Wstarc<T> {}
 pub struct PhysicalDevice(Starc<Share>);
 
 impl PhysicalDevice {
-    fn new_adapter<F>(fn_proc: F) -> hal::Adapter<Backend>
-    where
-        F: FnMut(&str) -> *const std::os::raw::c_void,
-    {
-        let gl = GlContainer {
-            context: gl::Gl::load_with(fn_proc),
-        };
-
+    #[allow(unused)]
+    fn new_adapter(gl: GlContainer) -> hal::Adapter<Backend> {
         // query information
         let (info, features, legacy_features, limits, private_caps) = info::query_all(&gl);
         info!("Vendor: {:?}", info.platform_name.vendor);
@@ -255,9 +341,69 @@ impl PhysicalDevice {
         for extension in info.extensions.iter() {
             debug!("- {}", *extension);
         }
-        let name = info.platform_name.renderer.into();
-        let vendor: std::string::String = info.platform_name.vendor.into();
-        let renderer: std::string::String = info.platform_name.renderer.into();
+        let name = info.platform_name.renderer.clone();
+        let vendor: std::string::String = info.platform_name.vendor.clone();
+        let renderer: std::string::String = info.platform_name.renderer.clone();
+
+        let mut memory_types = Vec::new();
+
+        let mut add_memory_type = |memory_type: hal::MemoryType| {
+            if private_caps.index_buffer_role_change {
+                // If `index_buffer_role_change` is true, we can use a buffer for any role
+                memory_types.push((
+                    memory_type,
+                    MemoryUsage::Buffer(buffer::Usage::all()),
+                ));
+            } else {
+                // If `index_buffer_role_change` is false, ELEMENT_ARRAY_BUFFER buffers may not be
+                // mixed with other targets, so we need to provide one type of memory for INDEX
+                // usage only and another type for all other uses.
+                memory_types.push((
+                    memory_type,
+                    MemoryUsage::Buffer(buffer::Usage::INDEX),
+                ));
+                memory_types.push((
+                    memory_type,
+                    MemoryUsage::Buffer(buffer::Usage::all() - buffer::Usage::INDEX),
+                ));
+            }
+        };
+
+        // Mimicking vulkan, memory types with more flags should come before those with fewer flags
+        if private_caps.map && private_caps.buffer_storage {
+            // Coherent memory is only available if we have `glBufferStorage`
+            add_memory_type(hal::MemoryType {
+                properties: memory::Properties::CPU_VISIBLE | memory::Properties::CPU_CACHED | memory::Properties::COHERENT,
+                heap_index: CPU_VISIBLE_HEAP,
+            });
+            add_memory_type(hal::MemoryType {
+                properties: memory::Properties::CPU_VISIBLE | memory::Properties::COHERENT,
+                heap_index: CPU_VISIBLE_HEAP,
+            });
+        }
+
+        if private_caps.map || private_caps.emulate_map {
+            add_memory_type(hal::MemoryType {
+                properties: memory::Properties::CPU_VISIBLE | memory::Properties::CPU_CACHED,
+                heap_index: CPU_VISIBLE_HEAP,
+            });
+        }
+
+        add_memory_type(hal::MemoryType {
+            properties: memory::Properties::DEVICE_LOCAL,
+            heap_index: DEVICE_LOCAL_HEAP,
+        });
+
+        // There is always a single device-local memory type for images
+        memory_types.push((
+            hal::MemoryType {
+                properties: memory::Properties::DEVICE_LOCAL,
+                heap_index: DEVICE_LOCAL_HEAP,
+            },
+            MemoryUsage::Image,
+        ));
+
+        assert!(memory_types.len() <= 64);
 
         // create the shared context
         let share = Share {
@@ -268,6 +414,7 @@ impl PhysicalDevice {
             limits,
             private_caps,
             open: Cell::new(false),
+            memory_types,
         };
         if let Err(err) = share.check() {
             panic!("Error querying info: {:?}", err);
@@ -299,6 +446,9 @@ impl PhysicalDevice {
             "mali",
             "intel",
         ];
+        let strings_that_imply_cpu = [
+            "mesa offscreen"
+        ];
         // todo: Intel will release a discrete gpu soon, and we will need to update this logic when they do
         let inferred_device_type = if vendor_lower.contains("qualcomm")
             || vendor_lower.contains("intel")
@@ -307,6 +457,11 @@ impl PhysicalDevice {
                 .any(|&s| renderer_lower.contains(s))
         {
             hal::adapter::DeviceType::IntegratedGpu
+        } else if strings_that_imply_cpu
+            .into_iter()
+            .any(|&s| renderer_lower.contains(s))
+        {
+            hal::adapter::DeviceType::Cpu
         } else {
             hal::adapter::DeviceType::DiscreteGpu
         };
@@ -372,21 +527,16 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
             .contains(info::LegacyFeatures::SRGB_COLOR)
         {
             // TODO: Find way to emulate this on older Opengl versions.
-
-            gl.Enable(gl::FRAMEBUFFER_SRGB);
+            gl.enable(glow::FRAMEBUFFER_SRGB);
         }
 
-        gl.PixelStorei(gl::UNPACK_ALIGNMENT, 1);
-
-        if !self.0.info.version.is_embedded {
-            gl.Enable(gl::PROGRAM_POINT_SIZE);
-        }
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
 
         // create main VAO and bind it
-        let mut vao = 0;
+        let mut vao = None;
         if self.0.private_caps.vertex_array {
-            gl.GenVertexArrays(1, &mut vao);
-            gl.BindVertexArray(vao);
+            vao = Some(gl.create_vertex_array().unwrap());
+            gl.bind_vertex_array(vao);
         }
 
         if let Err(err) = self.0.check() {
@@ -411,7 +561,15 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
     }
 
     fn format_properties(&self, _: Option<hal::format::Format>) -> hal::format::Properties {
-        unimplemented!()
+        use hal::format::ImageFeature;
+        use hal::format::BufferFeature;
+
+        // TODO: These are for show
+        hal::format::Properties {
+            linear_tiling: ImageFeature::SAMPLED,
+            optimal_tiling: ImageFeature::SAMPLED,
+            buffer_features: BufferFeature::VERTEX,
+        }
     }
 
     fn image_format_properties(
@@ -426,38 +584,9 @@ impl hal::PhysicalDevice<Backend> for PhysicalDevice {
     }
 
     fn memory_properties(&self) -> hal::MemoryProperties {
-        use hal::memory::Properties;
-
-        // COHERENT flags require that the backend does flushing and invalidation
-        // by itself. If we move towards persistent mapping we need to re-evaluate it.
-        let memory_types = if self.0.private_caps.map {
-            vec![
-                hal::MemoryType {
-                    properties: Properties::DEVICE_LOCAL,
-                    heap_index: 1,
-                },
-                hal::MemoryType {
-                    // upload
-                    properties: Properties::CPU_VISIBLE | Properties::COHERENT,
-                    heap_index: 0,
-                },
-                hal::MemoryType {
-                    // download
-                    properties: Properties::CPU_VISIBLE
-                        | Properties::COHERENT
-                        | Properties::CPU_CACHED,
-                    heap_index: 0,
-                },
-            ]
-        } else {
-            vec![hal::MemoryType {
-                properties: Properties::DEVICE_LOCAL,
-                heap_index: 0,
-            }]
-        };
-
         hal::MemoryProperties {
-            memory_types,
+            memory_types: self.0.memory_types.iter().map(|(mem_type, _)| *mem_type).collect(),
+            // heap 0 is DEVICE_LOCAL, heap 1 is CPU_VISIBLE
             memory_heaps: vec![!0, !0],
         }
     }
@@ -483,5 +612,40 @@ impl hal::QueueFamily for QueueFamily {
     }
     fn id(&self) -> QueueFamilyId {
         QueueFamilyId(0)
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "glutin"))]
+pub enum Instance {
+    Headless(Headless),
+    Surface(Surface)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "glutin"))]
+impl hal::Instance for Instance {
+    type Backend = Backend;
+    fn enumerate_adapters(&self) -> Vec<hal::Adapter<Backend>> {
+        match self {
+            Instance::Headless(instance) => instance.enumerate_adapters(),
+            Instance::Surface(instance) => instance.enumerate_adapters(),
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "glutin"))]
+impl Instance {
+    /// TODO: Update portability to make this more flexible
+    #[cfg(target_os = "linux")]
+    pub fn create(_: &str, _: u32) -> Instance {
+        use glutin::os::unix::HeadlessContextExt;
+        let size = glutin::dpi::PhysicalSize::from((800, 600));
+        let builder = glutin::ContextBuilder::new()
+            .with_hardware_acceleration(Some(false));
+        let context: glutin::Context<glutin::NotCurrent> =
+            HeadlessContextExt::build_osmesa(builder, size)
+                .expect("failed to create osmesa context");
+        let context = unsafe { context.make_current() }.expect("failed to make context current");
+        let headless = Headless::from_context(context);
+        Instance::Headless(headless)
     }
 }

@@ -1,22 +1,25 @@
-use command::IndexBuffer;
-use native::RasterizerState;
-use {BufferPtr, ResourceIndex, SamplerPtr, TexturePtr};
+use crate::{
+    BufferPtr, ResourceIndex, ResourcePtr, SamplerPtr, TexturePtr,
+    command::IndexBuffer,
+    native::RasterizerState,
+};
 
 use hal;
 use metal;
 
-use std::ops::Range;
+use std::{fmt::Debug, ops::Range};
+
 
 pub type CacheResourceIndex = u32;
 
-pub trait Resources {
-    type Data;
-    type BufferArray;
-    type TextureArray;
-    type SamplerArray;
-    type DepthStencil;
-    type RenderPipeline;
-    type ComputePipeline;
+pub trait Resources: Debug {
+    type Data: Debug;
+    type BufferArray: Debug;
+    type TextureArray: Debug;
+    type SamplerArray: Debug;
+    type DepthStencil: Debug;
+    type RenderPipeline: Debug;
+    type ComputePipeline: Debug;
 }
 
 #[derive(Clone, Debug, Default)]
@@ -88,6 +91,10 @@ pub enum RenderCommand<R: Resources> {
         samplers: R::SamplerArray,
     },
     BindPipeline(R::RenderPipeline),
+    UseResource {
+        resource: ResourcePtr,
+        usage: metal::MTLResourceUsage,
+    },
     Draw {
         primitive_type: metal::MTLPrimitiveType,
         vertices: Range<hal::VertexCount>,
@@ -168,6 +175,10 @@ pub enum ComputeCommand<R: Resources> {
         samplers: R::SamplerArray,
     },
     BindPipeline(R::ComputePipeline),
+    UseResource {
+        resource: ResourcePtr,
+        usage: metal::MTLResourceUsage,
+    },
     Dispatch {
         wg_size: metal::MTLSize,
         wg_count: metal::MTLSize,
@@ -266,6 +277,7 @@ impl Own {
                 },
             },
             BindPipeline(pso) => BindPipeline(pso.to_owned()),
+            UseResource { resource, usage } => UseResource { resource, usage },
             Draw {
                 primitive_type,
                 vertices,
@@ -356,6 +368,7 @@ impl Own {
                 },
             },
             BindPipeline(pso) => BindPipeline(pso.to_owned()),
+            UseResource { resource, usage } => UseResource { resource, usage },
             Dispatch { wg_size, wg_count } => Dispatch { wg_size, wg_count },
             DispatchIndirect {
                 wg_size,
@@ -372,15 +385,15 @@ impl Own {
     pub fn rebase_render(&self, com: &mut RenderCommand<Own>) {
         use self::RenderCommand::*;
         match *com {
-            SetViewport(..) |
-            SetScissor(..) |
-            SetBlendColor(..) |
-            SetDepthBias(..) |
-            SetDepthStencilState(..) |
-            SetStencilReferenceValues(..) |
-            SetRasterizerState(..) |
-            SetVisibilityResult(..) |
-            BindBuffer { .. } => {}
+            SetViewport(..)
+            | SetScissor(..)
+            | SetBlendColor(..)
+            | SetDepthBias(..)
+            | SetDepthStencilState(..)
+            | SetStencilReferenceValues(..)
+            | SetRasterizerState(..)
+            | SetVisibilityResult(..)
+            | BindBuffer { .. } => {}
             BindBuffers { ref mut buffers, .. } => {
                 buffers.start += self.buffers.len() as CacheResourceIndex;
                 buffers.end += self.buffers.len() as CacheResourceIndex;
@@ -394,11 +407,12 @@ impl Own {
                 samplers.start += self.samplers.len() as CacheResourceIndex;
                 samplers.end += self.samplers.len() as CacheResourceIndex;
             }
-            BindPipeline(..) |
-            Draw { .. } |
-            DrawIndexed { .. } |
-            DrawIndirect { .. } |
-            DrawIndexedIndirect { .. } => {}
+            BindPipeline(..)
+            | UseResource { .. }
+            | Draw { .. }
+            | DrawIndexed { .. }
+            | DrawIndirect { .. }
+            | DrawIndexedIndirect { .. } => {}
         }
     }
 
@@ -420,6 +434,7 @@ impl Own {
                 samplers.end += self.samplers.len() as CacheResourceIndex;
             }
             BindPipeline(..) |
+            UseResource { .. } |
             Dispatch { .. } |
             DispatchIndirect { .. } => {}
         }

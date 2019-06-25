@@ -1,45 +1,66 @@
 use std::cell::Cell;
+use std::ops::Range;
 use std::sync::{Arc, Mutex, RwLock};
 
-use hal::backend::FastHashMap;
-use hal::memory::{Properties, Requirements};
-use hal::{format, image as i, pass, pso};
+use crate::hal::backend::FastHashMap;
+use crate::hal::memory::{Properties, Requirements};
+use crate::hal::{buffer, format, image as i, pass, pso};
 
-use gl;
-use Backend;
+use crate::{Backend, GlContext};
 
-pub type RawBuffer = gl::types::GLuint;
-pub type Shader = gl::types::GLuint;
-pub type Program = gl::types::GLuint;
-pub type FrameBuffer = gl::types::GLuint;
-pub type Surface = gl::types::GLuint;
-pub type Texture = gl::types::GLuint;
-pub type Sampler = gl::types::GLuint;
+pub type TextureTarget = u32;
+pub type TextureFormat = u32;
+pub type DataType = u32;
 
+// TODO: Consider being generic over `glow::Context` instead
+pub type VertexArray = <GlContext as glow::Context>::VertexArray;
+pub type RawBuffer = <GlContext as glow::Context>::Buffer;
+pub type Shader = <GlContext as glow::Context>::Shader;
+pub type Program = <GlContext as glow::Context>::Program;
+pub type FrameBuffer = <GlContext as glow::Context>::Framebuffer;
+pub type Surface = <GlContext as glow::Context>::Renderbuffer;
+pub type Texture = <GlContext as glow::Context>::Texture;
+pub type Sampler = <GlContext as glow::Context>::Sampler;
+pub type UniformLocation = <GlContext as glow::Context>::UniformLocation;
 pub type DescriptorSetLayout = Vec<pso::DescriptorSetLayoutBinding>;
 
-pub const DEFAULT_FRAMEBUFFER: FrameBuffer = 0;
-
 #[derive(Debug)]
-pub struct Buffer {
-    pub(crate) raw: RawBuffer,
-    pub(crate) target: gl::types::GLenum,
-    pub(crate) requirements: Requirements,
+pub enum Buffer {
+    Unbound {
+        size: buffer::Offset,
+        usage: buffer::Usage,
+    },
+    Bound {
+        buffer: RawBuffer,
+        range: Range<buffer::Offset>,
+    },
+}
+
+impl Buffer {
+    // Asserts that the buffer is bound and returns the raw gl buffer along with its sub-range.
+    pub(crate) fn as_bound(&self) -> (RawBuffer, Range<u64>) {
+        match self {
+            Buffer::Unbound { .. } => panic!("Expected bound buffer!"),
+            Buffer::Bound {
+                buffer, range, ..
+            } => (*buffer, range.clone()),
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct BufferView;
 
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum FenceInner {
+    Idle { signaled: bool },
+    Pending(Option<<GlContext as glow::Context>::Fence>),
+}
+
 #[derive(Debug)]
-pub struct Fence(pub(crate) Cell<gl::types::GLsync>);
+pub struct Fence(pub(crate) Cell<FenceInner>);
 unsafe impl Send for Fence {}
 unsafe impl Sync for Fence {}
-
-impl Fence {
-    pub(crate) fn new(sync: gl::types::GLsync) -> Self {
-        Fence(Cell::new(sync))
-    }
-}
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub enum BindingTypes {
@@ -130,11 +151,14 @@ impl DescRemapData {
 #[derive(Clone, Debug)]
 pub struct GraphicsPipeline {
     pub(crate) program: Program,
-    pub(crate) primitive: gl::types::GLenum,
-    pub(crate) patch_size: Option<gl::types::GLint>,
+    pub(crate) primitive: u32,
+    pub(crate) patch_size: Option<i32>,
     pub(crate) blend_targets: Vec<pso::ColorBlendDesc>,
     pub(crate) attributes: Vec<AttributeDesc>,
     pub(crate) vertex_buffers: Vec<Option<pso::VertexBufferDesc>>,
+    pub(crate) uniforms: Vec<UniformDesc>,
+    pub(crate) rasterizer: pso::Rasterizer,
+    pub(crate) depth: pso::DepthTest,
 }
 
 #[derive(Clone, Debug)]
@@ -153,7 +177,12 @@ pub struct Image {
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum ImageKind {
     Surface(Surface),
-    Texture(Texture),
+    Texture {
+        texture: Texture,
+        target: TextureTarget,
+        format: TextureFormat,
+        pixel_type: DataType,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -167,8 +196,8 @@ pub enum FatSampler {
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum ImageView {
     Surface(Surface),
-    Texture(Texture, i::Level),
-    TextureLayer(Texture, i::Level, i::Layer),
+    Texture(Texture, TextureTarget, i::Level),
+    TextureLayer(Texture, TextureTarget, i::Level, i::Layer),
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -177,10 +206,10 @@ pub(crate) enum DescSetBindings {
         ty: BindingTypes,
         binding: pso::DescriptorBinding,
         buffer: RawBuffer,
-        offset: gl::types::GLintptr,
-        size: gl::types::GLsizeiptr,
+        offset: i32,
+        size: i32,
     },
-    Texture(pso::DescriptorBinding, Texture),
+    Texture(pso::DescriptorBinding, Texture, TextureTarget),
     Sampler(pso::DescriptorBinding, Sampler),
     SamplerInfo(pso::DescriptorBinding, i::SamplerInfo),
 }
@@ -220,41 +249,23 @@ impl pso::DescriptorPool<Backend> for DescriptorPool {
 #[derive(Clone, Debug, Hash)]
 pub enum ShaderModule {
     Raw(Shader),
-    Spirv(Vec<u8>),
+    Spirv(Vec<u32>),
 }
 
 #[derive(Debug)]
 pub struct Memory {
     pub(crate) properties: Properties,
-    pub(crate) first_bound_buffer: Cell<RawBuffer>,
+    /// Gl buffer and the target that should be used for map operations.  Image memory is faked and
+    /// has no associated buffer, so this will be None for image memory.
+    pub(crate) buffer: Option<(RawBuffer, u32)>,
     /// Allocation size
     pub(crate) size: u64,
+    pub(crate) map_flags: u32,
+    pub(crate) emulate_map_allocation: Cell<Option<*mut u8>>,
 }
 
 unsafe impl Send for Memory {}
 unsafe impl Sync for Memory {}
-
-impl Memory {
-    pub fn can_upload(&self) -> bool {
-        self.properties.contains(Properties::CPU_VISIBLE)
-    }
-
-    pub fn can_download(&self) -> bool {
-        self.properties
-            .contains(Properties::CPU_VISIBLE | Properties::CPU_CACHED)
-    }
-
-    pub fn map_flags(&self) -> gl::types::GLenum {
-        let mut flags = 0;
-        if self.can_download() {
-            flags |= gl::MAP_READ_BIT;
-        }
-        if self.can_upload() {
-            flags |= gl::MAP_WRITE_BIT;
-        }
-        flags
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct RenderPass {
@@ -265,12 +276,18 @@ pub struct RenderPass {
 #[derive(Clone, Debug)]
 pub struct SubpassDesc {
     pub(crate) color_attachments: Vec<usize>,
+    pub(crate) depth_stencil: Option<usize>,
 }
 
 impl SubpassDesc {
     /// Check if an attachment is used by this sub-pass.
     pub(crate) fn is_using(&self, at_id: pass::AttachmentId) -> bool {
-        self.color_attachments.iter().any(|id| *id == at_id)
+        let uses_ds = match self.depth_stencil {
+            Some(ds) => ds == at_id,
+            None => false,
+        };
+        let uses_color = self.color_attachments.iter().any(|id| *id == at_id);
+        uses_color || uses_ds
     }
 }
 
@@ -285,12 +302,19 @@ pub struct Semaphore;
 
 #[derive(Clone, Debug)]
 pub struct AttributeDesc {
-    pub(crate) location: gl::types::GLuint,
+    pub(crate) location: u32,
     pub(crate) offset: u32,
-    pub(crate) binding: gl::types::GLuint,
-    pub(crate) size: gl::types::GLint,
-    pub(crate) format: gl::types::GLenum,
+    pub(crate) binding: u32,
+    pub(crate) size: i32,
+    pub(crate) format: u32,
     pub(crate) vertex_attrib_fn: VertexAttribFunction,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct UniformDesc {
+    pub(crate) location: UniformLocation,
+    pub(crate) offset: u32,
+    pub(crate) utype: u32,
 }
 
 #[derive(Debug, Clone, Copy)]

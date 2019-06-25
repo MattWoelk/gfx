@@ -7,10 +7,11 @@
 //! that has the properties specified.
 
 use std::any::Any;
+use std::fmt;
 
-use error::DeviceCreationError;
-use queue::{Capability, QueueGroup};
-use {format, image, memory, Backend, Features, Gpu, Limits};
+use crate::error::DeviceCreationError;
+use crate::queue::{Capability, QueueGroup};
+use crate::{format, image, memory, Backend, Features, Gpu, Limits};
 
 /// Scheduling hint for devices about the priority of a queue.  Values range from `0.0` (low) to
 /// `1.0` (high).
@@ -50,7 +51,7 @@ pub struct MemoryProperties {
 }
 
 /// Represents a physical device (such as a GPU) capable of supporting the given backend.
-pub trait PhysicalDevice<B: Backend>: Any + Send + Sync {
+pub trait PhysicalDevice<B: Backend>: fmt::Debug + Any + Send + Sync {
     /// Create a new logical device with the requested features. If `requested_features` is
     /// empty (e.g. through `Features::empty()`) then only the core features are supported.
     ///
@@ -103,7 +104,9 @@ pub trait PhysicalDevice<B: Backend>: Any + Send + Sync {
     fn limits(&self) -> Limits;
 
     /// Check cache compatibility with the `Device`.
-    fn is_valid_cache(&self, _cache: &[u8]) -> bool { false }
+    fn is_valid_cache(&self, _cache: &[u8]) -> bool {
+        false
+    }
 }
 
 /// Supported physical device types
@@ -142,6 +145,7 @@ pub struct AdapterInfo {
 /// `physical_device` field. However, if only a single queue family is needed or if no
 /// additional device features are required, then the `Adapter::open_with` convenience method
 /// can be used instead.
+#[derive(Debug)]
 pub struct Adapter<B: Backend> {
     /// General information about this adapter.
     pub info: AdapterInfo,
@@ -182,17 +186,11 @@ impl<B: Backend> Adapter<B> {
         F: Fn(&B::QueueFamily) -> bool,
         C: Capability,
     {
-        use queue::QueueFamily;
+        use crate::queue::QueueFamily;
 
-        let requested_family = self
-            .queue_families
-            .iter()
-            .filter(|family| {
-                C::supported_by(family.queue_type())
-                    && selector(&family)
-                    && count <= family.max_queues()
-            })
-            .next();
+        let requested_family = self.queue_families.iter().find(|family| {
+            C::supported_by(family.queue_type()) && selector(family) && count <= family.max_queues()
+        });
 
         let priorities = vec![1.0; count];
         let (id, families) = match requested_family {

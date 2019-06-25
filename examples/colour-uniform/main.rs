@@ -1,6 +1,7 @@
 #![cfg_attr(
     not(any(
         feature = "vulkan",
+        feature = "dx11",
         feature = "dx12",
         feature = "metal",
         feature = "gl"
@@ -8,10 +9,13 @@
     allow(dead_code, unused_extern_crates, unused_imports)
 )]
 
+#[cfg(feature = "dx11")]
+extern crate gfx_backend_dx11 as back;
 #[cfg(feature = "dx12")]
 extern crate gfx_backend_dx12 as back;
 #[cfg(not(any(
     feature = "vulkan",
+    feature = "dx11",
     feature = "dx12",
     feature = "metal",
     feature = "gl"
@@ -38,20 +42,20 @@ struct Dimensions<T> {
 }
 
 use std::cell::RefCell;
-use std::io::{Cursor, Read};
+use std::io::Cursor;
 use std::mem::size_of;
 use std::rc::Rc;
 use std::{fs, iter};
 
 use hal::{
     buffer, command, format as f, image as i, memory as m, pass, pool, pso, window::Extent2D,
-    Adapter, Backbuffer, Backend, DescriptorPool, Device, FrameSync, Instance, Limits, MemoryType,
+    Adapter, Backend, DescriptorPool, Device, Instance, Limits, MemoryType,
     PhysicalDevice, Primitive, QueueGroup, Surface, Swapchain, SwapchainConfig,
 };
 
 use hal::format::{AsFormat, ChannelType, Rgba8Srgb as ColorFormat, Swizzle};
 use hal::pass::Subpass;
-use hal::pso::{PipelineStage, ShaderStageFlags};
+use hal::pso::{PipelineStage, ShaderStageFlags, VertexInputRate};
 use hal::queue::Submission;
 
 const ENTRY_NAME: &str = "main";
@@ -101,13 +105,13 @@ const COLOR_RANGE: i::SubresourceRange = i::SubresourceRange {
 
 trait SurfaceTrait {
     #[cfg(feature = "gl")]
-    fn get_window_t(&self) -> &back::glutin::GlWindow;
+    fn get_window_t(&self) -> &back::glutin::WindowedContext<back::glutin::PossiblyCurrent>;
 }
 
 impl SurfaceTrait for <back::Backend as hal::Backend>::Surface {
     #[cfg(feature = "gl")]
-    fn get_window_t(&self) -> &back::glutin::GlWindow {
-        self.get_window()
+    fn get_window_t(&self) -> &back::glutin::WindowedContext<back::glutin::PossiblyCurrent> {
+        self.get_context()
     }
 }
 
@@ -188,6 +192,7 @@ impl<B: Backend> RendererState<B> {
                         count: 1,
                     },
                 ],
+                pso::DescriptorPoolCreateFlags::empty(),
             )
             .ok();
 
@@ -200,6 +205,7 @@ impl<B: Backend> RendererState<B> {
                     ty: pso::DescriptorType::UniformBuffer,
                     count: 1,
                 }],
+                pso::DescriptorPoolCreateFlags::empty(),
             )
             .ok();
 
@@ -381,7 +387,7 @@ impl<B: Backend> RendererState<B> {
                             winit::WindowEvent::Resized(dims) => {
                                 #[cfg(feature = "gl")]
                                 backend.surface.get_window_t().resize(dims.to_physical(
-                                    backend.surface.get_window_t().get_hidpi_factor(),
+                                    backend.surface.get_window_t().window().get_hidpi_factor(),
                                 ));
                                 recreate_swapchain = true;
                             }
@@ -508,9 +514,9 @@ impl<B: Backend> RendererState<B> {
                     .swapchain
                     .as_mut()
                     .unwrap()
-                    .acquire_image(!0, FrameSync::Semaphore(acquire_semaphore))
+                    .acquire_image(!0, Some(acquire_semaphore), None)
                 {
-                    Ok(i) => i,
+                    Ok((i, _)) => i,
                     Err(_) => {
                         recreate_swapchain = true;
                         continue;
@@ -522,7 +528,7 @@ impl<B: Backend> RendererState<B> {
                 .framebuffer
                 .get_frame_data(Some(frame as usize), Some(sem_index));
 
-            let (framebuffer_fence, framebuffer, command_pool) = fid.unwrap();
+            let (framebuffer_fence, framebuffer, command_pool, command_buffers) = fid.unwrap();
             let (image_acquired, image_present) = sid.unwrap();
 
             unsafe {
@@ -536,10 +542,13 @@ impl<B: Backend> RendererState<B> {
                     .device
                     .reset_fence(framebuffer_fence)
                     .unwrap();
-                command_pool.reset();
+                command_pool.reset(false);
 
                 // Rendering
-                let mut cmd_buffer = command_pool.acquire_command_buffer::<command::OneShot>();
+                let mut cmd_buffer = match command_buffers.pop() {
+                    Some(cmd_buffer) => cmd_buffer,
+                    None => command_pool.acquire_command_buffer(),
+                };
                 cmd_buffer.begin();
 
                 cmd_buffer.set_viewports(0, &[self.viewport.clone()]);
@@ -561,7 +570,7 @@ impl<B: Backend> RendererState<B> {
                         self.render_pass.render_pass.as_ref().unwrap(),
                         framebuffer,
                         self.viewport.rect,
-                        &[command::ClearValue::Color(command::ClearColor::Float([
+                        &[command::ClearValue::Color(command::ClearColor::Sfloat([
                             cr, cg, cb, 1.0,
                         ]))],
                     );
@@ -577,6 +586,7 @@ impl<B: Backend> RendererState<B> {
 
                 self.device.borrow_mut().queues.queues[0]
                     .submit(submission, Some(framebuffer_fence));
+                command_buffers.push(cmd_buffer);
 
                 // present frame
                 if let Err(_) = self
@@ -627,11 +637,15 @@ impl WindowState {
         let events_loop = winit::EventsLoop::new();
 
         let wb = winit::WindowBuilder::new()
+            .with_min_dimensions(winit::dpi::LogicalSize::new(
+                1.0,
+                1.0,
+            ))
             .with_dimensions(winit::dpi::LogicalSize::new(
                 DIMS.width as _,
                 DIMS.height as _,
             ))
-            .with_title("quad".to_string());
+            .with_title("colour-uniform".to_string());
 
         WindowState {
             events_loop,
@@ -643,12 +657,12 @@ impl WindowState {
 struct BackendState<B: Backend> {
     surface: B::Surface,
     adapter: AdapterState<B>,
-    #[cfg(any(feature = "vulkan", feature = "dx12", feature = "metal"))]
+    #[cfg(any(feature = "vulkan", feature = "dx11", feature = "dx12", feature = "metal"))]
     #[allow(dead_code)]
     window: winit::Window,
 }
 
-#[cfg(any(feature = "vulkan", feature = "dx12", feature = "metal"))]
+#[cfg(any(feature = "vulkan", feature = "dx11", feature = "dx12", feature = "metal"))]
 fn create_backend(window_state: &mut WindowState) -> (BackendState<back::Backend>, back::Instance) {
     let window = window_state
         .wb
@@ -656,7 +670,7 @@ fn create_backend(window_state: &mut WindowState) -> (BackendState<back::Backend
         .unwrap()
         .build(&window_state.events_loop)
         .unwrap();
-    let instance = back::Instance::create("gfx-rs quad", 1);
+    let instance = back::Instance::create("gfx-rs colour-uniform", 1);
     let surface = instance.create_surface(&window);
     let mut adapters = instance.enumerate_adapters();
     (
@@ -675,12 +689,10 @@ fn create_backend(window_state: &mut WindowState) -> (BackendState<back::Backend
         let builder =
             back::config_context(back::glutin::ContextBuilder::new(), ColorFormat::SELF, None)
                 .with_vsync(true);
-        back::glutin::GlWindow::new(
-            window_state.wb.take().unwrap(),
-            builder,
-            &window_state.events_loop,
-        )
-        .unwrap()
+        let context = builder
+            .build_windowed(window_state.wb.take().unwrap(), &window_state.events_loop)
+            .unwrap();
+        unsafe { context.make_current() }.expect("Unable to make context current")
     };
 
     let surface = back::Surface::from_window(window);
@@ -727,13 +739,13 @@ impl<B: Backend> AdapterState<B> {
 struct DeviceState<B: Backend> {
     device: B::Device,
     physical_device: B::PhysicalDevice,
-    queues: QueueGroup<B, ::hal::Graphics>,
+    queues: QueueGroup<B, hal::Graphics>,
 }
 
 impl<B: Backend> DeviceState<B> {
     fn new(adapter: Adapter<B>, surface: &B::Surface) -> Self {
         let (device, queues) = adapter
-            .open_with::<_, ::hal::Graphics>(1, |family| surface.supports_queue_family(family))
+            .open_with::<_, hal::Graphics>(1, |family| surface.supports_queue_family(family))
             .unwrap();
 
         DeviceState {
@@ -902,7 +914,7 @@ impl<B: Backend> BufferState<B> {
     ) -> (Self, Dimensions<u32>, u32, usize) {
         let (width, height) = img.dimensions();
 
-        let row_alignment_mask = adapter.limits.min_buffer_copy_pitch_alignment as u32 - 1;
+        let row_alignment_mask = adapter.limits.optimal_buffer_copy_pitch_alignment as u32 - 1;
         let stride = 4usize;
 
         let row_pitch = (width * stride as u32 + row_alignment_mask) & !row_alignment_mask;
@@ -1112,13 +1124,13 @@ struct ImageState<B: Backend> {
 }
 
 impl<B: Backend> ImageState<B> {
-    unsafe fn new<T: ::hal::Supports<::hal::Transfer>>(
+    unsafe fn new<T: hal::Supports<hal::Transfer>>(
         mut desc: DescSet<B>,
         img: &::image::ImageBuffer<::image::Rgba<u8>, Vec<u8>>,
         adapter: &AdapterState<B>,
         usage: buffer::Usage,
         device_state: &mut DeviceState<B>,
-        staging_pool: &mut ::hal::CommandPool<B, ::hal::Graphics>,
+        staging_pool: &mut hal::CommandPool<B, hal::Graphics>,
     ) -> Self {
         let (buffer, dims, row_pitch, stride) = BufferState::new_texture(
             Rc::clone(&desc.layout.device),
@@ -1247,7 +1259,7 @@ impl<B: Backend> ImageState<B> {
             cmd_buffer.finish();
 
             device_state.queues.queues[0]
-                .submit_nosemaphores(iter::once(&cmd_buffer), Some(&mut transfered_image_fence));
+                .submit_without_semaphores(iter::once(&cmd_buffer), Some(&mut transfered_image_fence));
         }
 
         ImageState {
@@ -1318,22 +1330,16 @@ impl<B: Backend> PipelineState<B> {
         let pipeline = {
             let vs_module = {
                 let glsl = fs::read_to_string("colour-uniform/data/quad.vert").unwrap();
-                let spirv: Vec<u8> =
-                    glsl_to_spirv::compile(&glsl, glsl_to_spirv::ShaderType::Vertex)
-                        .unwrap()
-                        .bytes()
-                        .map(|b| b.unwrap())
-                        .collect();
+                let file = glsl_to_spirv::compile(&glsl, glsl_to_spirv::ShaderType::Vertex)
+                    .unwrap();
+                let spirv: Vec<u32> = hal::read_spirv(file).unwrap();
                 device.create_shader_module(&spirv).unwrap()
             };
             let fs_module = {
                 let glsl = fs::read_to_string("colour-uniform/data/quad.frag").unwrap();
-                let spirv: Vec<u8> =
-                    glsl_to_spirv::compile(&glsl, glsl_to_spirv::ShaderType::Fragment)
-                        .unwrap()
-                        .bytes()
-                        .map(|b| b.unwrap())
-                        .collect();
+                let file = glsl_to_spirv::compile(&glsl, glsl_to_spirv::ShaderType::Fragment)
+                    .unwrap();
+                let spirv: Vec<u32> = hal::read_spirv(file).unwrap();
                 device.create_shader_module(&spirv).unwrap()
             };
 
@@ -1342,10 +1348,7 @@ impl<B: Backend> PipelineState<B> {
                     pso::EntryPoint::<B> {
                         entry: ENTRY_NAME,
                         module: &vs_module,
-                        specialization: pso::Specialization {
-                            constants: &[pso::SpecializationConstant { id: 0, range: 0..4 }],
-                            data: std::mem::transmute::<&f32, &[u8; 4]>(&0.8f32),
-                        },
+                        specialization: hal::spec_const_list![0.8f32],
                     },
                     pso::EntryPoint::<B> {
                         entry: ENTRY_NAME,
@@ -1381,14 +1384,14 @@ impl<B: Backend> PipelineState<B> {
                 pipeline_desc.vertex_buffers.push(pso::VertexBufferDesc {
                     binding: 0,
                     stride: size_of::<Vertex>() as u32,
-                    rate: 0,
+                    rate: VertexInputRate::Vertex,
                 });
 
                 pipeline_desc.attributes.push(pso::AttributeDesc {
                     location: 0,
                     binding: 0,
                     element: pso::Element {
-                        format: f::Format::Rg32Float,
+                        format: f::Format::Rg32Sfloat,
                         offset: 0,
                     },
                 });
@@ -1396,7 +1399,7 @@ impl<B: Backend> PipelineState<B> {
                     location: 1,
                     binding: 0,
                     element: pso::Element {
-                        format: f::Format::Rg32Float,
+                        format: f::Format::Rg32Sfloat,
                         offset: 8,
                     },
                 });
@@ -1430,7 +1433,7 @@ impl<B: Backend> Drop for PipelineState<B> {
 
 struct SwapchainState<B: Backend> {
     swapchain: Option<B::Swapchain>,
-    backbuffer: Option<Backbuffer<B>>,
+    backbuffer: Option<Vec<B::Image>>,
     device: Rc<RefCell<DeviceState<B>>>,
     extent: i::Extent,
     format: f::Format,
@@ -1485,6 +1488,7 @@ struct FramebufferState<B: Backend> {
     framebuffers: Option<Vec<B::Framebuffer>>,
     framebuffer_fences: Option<Vec<B::Fence>>,
     command_pools: Option<Vec<hal::CommandPool<B, hal::Graphics>>>,
+    command_buffer_lists: Vec<Vec<hal::command::CommandBuffer<B, hal::Graphics>>>,
     frame_images: Option<Vec<(B::Image, B::ImageView)>>,
     acquire_semaphores: Option<Vec<B::Semaphore>>,
     present_semaphores: Option<Vec<B::Semaphore>>,
@@ -1498,47 +1502,44 @@ impl<B: Backend> FramebufferState<B> {
         render_pass: &RenderPassState<B>,
         swapchain: &mut SwapchainState<B>,
     ) -> Self {
-        let (frame_images, framebuffers) = match swapchain.backbuffer.take().unwrap() {
-            Backbuffer::Images(images) => {
-                let extent = i::Extent {
-                    width: swapchain.extent.width as _,
-                    height: swapchain.extent.height as _,
-                    depth: 1,
-                };
-                let pairs = images
-                    .into_iter()
-                    .map(|image| {
-                        let rtv = device
-                            .borrow()
-                            .device
-                            .create_image_view(
-                                &image,
-                                i::ViewKind::D2,
-                                swapchain.format,
-                                Swizzle::NO,
-                                COLOR_RANGE.clone(),
-                            )
-                            .unwrap();
-                        (image, rtv)
-                    })
-                    .collect::<Vec<_>>();
-                let fbos = pairs
-                    .iter()
-                    .map(|&(_, ref rtv)| {
-                        device
-                            .borrow()
-                            .device
-                            .create_framebuffer(
-                                render_pass.render_pass.as_ref().unwrap(),
-                                Some(rtv),
-                                extent,
-                            )
-                            .unwrap()
-                    })
-                    .collect();
-                (pairs, fbos)
-            }
-            Backbuffer::Framebuffer(fbo) => (Vec::new(), vec![fbo]),
+        let (frame_images, framebuffers) = {
+            let extent = i::Extent {
+                width: swapchain.extent.width as _,
+                height: swapchain.extent.height as _,
+                depth: 1,
+            };
+            let pairs = swapchain.backbuffer.take().unwrap()
+                .into_iter()
+                .map(|image| {
+                    let rtv = device
+                        .borrow()
+                        .device
+                        .create_image_view(
+                            &image,
+                            i::ViewKind::D2,
+                            swapchain.format,
+                            Swizzle::NO,
+                            COLOR_RANGE.clone(),
+                        )
+                        .unwrap();
+                    (image, rtv)
+                })
+                .collect::<Vec<_>>();
+            let fbos = pairs
+                .iter()
+                .map(|&(_, ref rtv)| {
+                    device
+                        .borrow()
+                        .device
+                        .create_framebuffer(
+                            render_pass.render_pass.as_ref().unwrap(),
+                            Some(rtv),
+                            extent,
+                        )
+                        .unwrap()
+                })
+                .collect();
+            (pairs, fbos)
         };
 
         let iter_count = if frame_images.len() != 0 {
@@ -1549,6 +1550,7 @@ impl<B: Backend> FramebufferState<B> {
 
         let mut fences: Vec<B::Fence> = vec![];
         let mut command_pools: Vec<hal::CommandPool<B, hal::Graphics>> = vec![];
+        let mut command_buffer_lists = Vec::new();
         let mut acquire_semaphores: Vec<B::Semaphore> = vec![];
         let mut present_semaphores: Vec<B::Semaphore> = vec![];
 
@@ -1564,6 +1566,7 @@ impl<B: Backend> FramebufferState<B> {
                     )
                     .expect("Can't create command pool"),
             );
+            command_buffer_lists.push(Vec::new());
 
             acquire_semaphores.push(device.borrow().device.create_semaphore().unwrap());
             present_semaphores.push(device.borrow().device.create_semaphore().unwrap());
@@ -1574,6 +1577,7 @@ impl<B: Backend> FramebufferState<B> {
             framebuffers: Some(framebuffers),
             framebuffer_fences: Some(fences),
             command_pools: Some(command_pools),
+            command_buffer_lists,
             present_semaphores: Some(present_semaphores),
             acquire_semaphores: Some(acquire_semaphores),
             device,
@@ -1599,7 +1603,8 @@ impl<B: Backend> FramebufferState<B> {
         Option<(
             &mut B::Fence,
             &mut B::Framebuffer,
-            &mut hal::CommandPool<B, ::hal::Graphics>,
+            &mut hal::CommandPool<B, hal::Graphics>,
+            &mut Vec<hal::command::CommandBuffer<B, hal::Graphics>>,
         )>,
         Option<(&mut B::Semaphore, &mut B::Semaphore)>,
     ) {
@@ -1609,6 +1614,7 @@ impl<B: Backend> FramebufferState<B> {
                     &mut self.framebuffer_fences.as_mut().unwrap()[fid],
                     &mut self.framebuffers.as_mut().unwrap()[fid],
                     &mut self.command_pools.as_mut().unwrap()[fid],
+                    &mut self.command_buffer_lists[fid],
                 ))
             } else {
                 None
@@ -1635,7 +1641,13 @@ impl<B: Backend> Drop for FramebufferState<B> {
                 device.destroy_fence(fence);
             }
 
-            for command_pool in self.command_pools.take().unwrap() {
+            for (mut command_pool, comamnd_buffer_list) in self.command_pools
+                .take()
+                .unwrap()
+                .into_iter()
+                .zip(self.command_buffer_lists.drain(..))
+            {
+                command_pool.free(comamnd_buffer_list);
                 device.destroy_command_pool(command_pool.into_raw());
             }
 
@@ -1660,6 +1672,7 @@ impl<B: Backend> Drop for FramebufferState<B> {
 
 #[cfg(any(
     feature = "vulkan",
+    feature = "dx11",
     feature = "dx12",
     feature = "metal",
     feature = "gl"
@@ -1676,6 +1689,7 @@ fn main() {
 
 #[cfg(not(any(
     feature = "vulkan",
+    feature = "dx11",
     feature = "dx12",
     feature = "metal",
     feature = "gl"

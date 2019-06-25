@@ -6,7 +6,7 @@
 //! They can be used as shader resources, vertex buffers, index buffers or for
 //! specifying the action commands for indirect execution.
 
-use {device, format, Backend, IndexType};
+use crate::{device, format, Backend, IndexType};
 
 /// An offset inside a buffer, in bytes.
 pub type Offset = u64;
@@ -131,6 +131,7 @@ bitflags!(
 ///
 /// Defines a buffer slice used for acquiring the indices on draw commands.
 /// Indices are used to lookup vertex indices in the vertex buffers.
+#[derive(Debug)]
 pub struct IndexBufferView<'a, B: Backend> {
     /// The buffer to bind.
     pub buffer: &'a B::Buffer,

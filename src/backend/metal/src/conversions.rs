@@ -1,13 +1,17 @@
-use PrivateCapabilities;
+use hal;
 
-use hal::format::{Format, Properties, Swizzle};
-use hal::pso::{Comparison, StencilOp};
-use hal::{image, pass, pso, IndexType};
+use crate::PrivateCapabilities;
+
+use hal::{
+    image, pass, pso, IndexType,
+    format::{Format, Properties, Swizzle},
+    pso::{Comparison, StencilOp},
+};
 use metal::*;
 
 impl PrivateCapabilities {
     pub fn map_format(&self, format: Format) -> Option<MTLPixelFormat> {
-        use hal::format::Format as f;
+        use self::hal::format::Format as f;
         use metal::MTLPixelFormat::*;
         Some(match format {
             f::R5g6b5Unorm if self.format_b5 => B5G6R5Unorm,
@@ -19,50 +23,50 @@ impl PrivateCapabilities {
             f::Rgba8Srgb if self.format_min_srgb_channels <= 4 => RGBA8Unorm_sRGB,
             f::Bgra8Srgb if self.format_min_srgb_channels <= 4 => BGRA8Unorm_sRGB,
             f::D24UnormS8Uint if self.format_depth24_stencil8 => Depth24Unorm_Stencil8,
-            f::D32FloatS8Uint if self.format_depth32_stencil8_filter => Depth32Float_Stencil8,
+            f::D32SfloatS8Uint if self.format_depth32_stencil8_filter => Depth32Float_Stencil8,
             f::R8Unorm => R8Unorm,
-            f::R8Inorm => R8Snorm,
+            f::R8Snorm => R8Snorm,
             f::R8Uint => R8Uint,
-            f::R8Int => R8Sint,
+            f::R8Sint => R8Sint,
             f::Rg8Unorm => RG8Unorm,
-            f::Rg8Inorm => RG8Snorm,
+            f::Rg8Snorm => RG8Snorm,
             f::Rg8Uint => RG8Uint,
-            f::Rg8Int => RG8Sint,
+            f::Rg8Sint => RG8Sint,
             f::Rgba8Unorm => RGBA8Unorm,
-            f::Rgba8Inorm => RGBA8Snorm,
+            f::Rgba8Snorm => RGBA8Snorm,
             f::Rgba8Uint => RGBA8Uint,
-            f::Rgba8Int => RGBA8Sint,
+            f::Rgba8Sint => RGBA8Sint,
             f::Bgra8Unorm => BGRA8Unorm,
             f::R16Unorm => R16Unorm,
-            f::R16Inorm => R16Snorm,
+            f::R16Snorm => R16Snorm,
             f::R16Uint => R16Uint,
-            f::R16Int => R16Sint,
-            f::R16Float => R16Float,
+            f::R16Sint => R16Sint,
+            f::R16Sfloat => R16Float,
             f::Rg16Unorm => RG16Unorm,
-            f::Rg16Inorm => RG16Snorm,
+            f::Rg16Snorm => RG16Snorm,
             f::Rg16Uint => RG16Uint,
-            f::Rg16Int => RG16Sint,
-            f::Rg16Float => RG16Float,
+            f::Rg16Sint => RG16Sint,
+            f::Rg16Sfloat => RG16Float,
             f::Rgba16Unorm => RGBA16Unorm,
-            f::Rgba16Inorm => RGBA16Snorm,
+            f::Rgba16Snorm => RGBA16Snorm,
             f::Rgba16Uint => RGBA16Uint,
-            f::Rgba16Int => RGBA16Sint,
-            f::Rgba16Float => RGBA16Float,
+            f::Rgba16Sint => RGBA16Sint,
+            f::Rgba16Sfloat => RGBA16Float,
             f::A2r10g10b10Unorm => BGR10A2Unorm,
             f::A2b10g10r10Unorm => RGB10A2Unorm,
             f::B10g11r11Ufloat => RG11B10Float,
             f::E5b9g9r9Ufloat => RGB9E5Float,
             f::R32Uint => R32Uint,
-            f::R32Int => R32Sint,
-            f::R32Float => R32Float,
+            f::R32Sint => R32Sint,
+            f::R32Sfloat => R32Float,
             f::Rg32Uint => RG32Uint,
-            f::Rg32Int => RG32Sint,
-            f::Rg32Float => RG32Float,
+            f::Rg32Sint => RG32Sint,
+            f::Rg32Sfloat => RG32Float,
             f::Rgba32Uint => RGBA32Uint,
-            f::Rgba32Int => RGBA32Sint,
-            f::Rgba32Float => RGBA32Float,
+            f::Rgba32Sint => RGBA32Sint,
+            f::Rgba32Sfloat => RGBA32Float,
             f::D16Unorm => Depth16Unorm,
-            f::D32Float => Depth32Float,
+            f::D32Sfloat => Depth32Float,
             f::Bc1RgbaUnorm if self.format_bc => BC1_RGBA,
             f::Bc1RgbaSrgb if self.format_bc => BC1_RGBA_sRGB,
             f::Bc1RgbUnorm if self.format_bc => BC1_RGBA, //TODO?
@@ -72,17 +76,17 @@ impl PrivateCapabilities {
             f::Bc3Unorm if self.format_bc => BC3_RGBA,
             f::Bc3Srgb if self.format_bc => BC3_RGBA_sRGB,
             f::Bc4Unorm if self.format_bc => BC4_RUnorm,
-            f::Bc4Inorm if self.format_bc => BC4_RSnorm,
+            f::Bc4Snorm if self.format_bc => BC4_RSnorm,
             f::Bc5Unorm if self.format_bc => BC5_RGUnorm,
-            f::Bc5Inorm if self.format_bc => BC5_RGSnorm,
+            f::Bc5Snorm if self.format_bc => BC5_RGSnorm,
             f::Bc6hUfloat if self.format_bc => BC6H_RGBUfloat,
-            f::Bc6hFloat if self.format_bc => BC6H_RGBFloat,
+            f::Bc6hSfloat if self.format_bc => BC6H_RGBFloat,
             f::Bc7Unorm if self.format_bc => BC7_RGBAUnorm,
             f::Bc7Srgb if self.format_bc => BC7_RGBAUnorm_sRGB,
             f::EacR11Unorm if self.format_eac_etc => EAC_R11Unorm,
-            f::EacR11Inorm if self.format_eac_etc => EAC_R11Snorm,
+            f::EacR11Snorm if self.format_eac_etc => EAC_R11Snorm,
             f::EacR11g11Unorm if self.format_eac_etc => EAC_RG11Unorm,
-            f::EacR11g11Inorm if self.format_eac_etc => EAC_RG11Snorm,
+            f::EacR11g11Snorm if self.format_eac_etc => EAC_RG11Snorm,
             f::Etc2R8g8b8Unorm if self.format_eac_etc => ETC2_RGB8,
             f::Etc2R8g8b8Srgb if self.format_eac_etc => ETC2_RGB8_sRGB,
             f::Etc2R8g8b8a1Unorm if self.format_eac_etc => ETC2_RGB8A1,
@@ -146,7 +150,7 @@ impl PrivateCapabilities {
         format: Format,
         swizzle: Swizzle,
     ) -> Option<MTLPixelFormat> {
-        use hal::format::{Component::*, Format::*};
+        use self::hal::format::{Component::*, Format::*};
         use metal::MTLPixelFormat as Pf;
         match (format, swizzle) {
             (R8Unorm, Swizzle(Zero, Zero, Zero, R)) => Some(Pf::A8Unorm),
@@ -166,7 +170,7 @@ impl PrivateCapabilities {
     }
 
     pub fn map_format_properties(&self, format: MTLPixelFormat) -> Properties {
-        use hal::format::{BufferFeature as Bf, ImageFeature as If};
+        use self::hal::format::{BufferFeature as Bf, ImageFeature as If};
         use metal::MTLPixelFormat::*;
 
         let buffer_features = Bf::all();
@@ -941,7 +945,7 @@ pub fn map_write_mask(mask: pso::ColorMask) -> MTLColorWriteMask {
 }
 
 fn map_factor(factor: pso::Factor) -> MTLBlendFactor {
-    use hal::pso::Factor::*;
+    use self::hal::pso::Factor::*;
 
     match factor {
         Zero => MTLBlendFactor::Zero,
@@ -967,11 +971,11 @@ fn map_factor(factor: pso::Factor) -> MTLBlendFactor {
 }
 
 pub fn map_blend_op(
-    operation: &pso::BlendOp,
+    operation: pso::BlendOp,
 ) -> (MTLBlendOperation, MTLBlendFactor, MTLBlendFactor) {
-    use hal::pso::BlendOp::*;
+    use self::hal::pso::BlendOp::*;
 
-    match *operation {
+    match operation {
         Add { src, dst } => (MTLBlendOperation::Add, map_factor(src), map_factor(dst)),
         Sub { src, dst } => (
             MTLBlendOperation::Subtract,
@@ -997,58 +1001,58 @@ pub fn map_blend_op(
 }
 
 pub fn map_vertex_format(format: Format) -> Option<MTLVertexFormat> {
-    use hal::format::Format as f;
+    use self::hal::format::Format as f;
     use metal::MTLVertexFormat::*;
     Some(match format {
         f::R8Unorm => UCharNormalized,
-        f::R8Inorm => CharNormalized,
+        f::R8Snorm => CharNormalized,
         f::R8Uint => UChar,
-        f::R8Int => Char,
+        f::R8Sint => Char,
         f::Rg8Unorm => UChar2Normalized,
-        f::Rg8Inorm => Char2Normalized,
+        f::Rg8Snorm => Char2Normalized,
         f::Rg8Uint => UChar2,
-        f::Rg8Int => Char2,
+        f::Rg8Sint => Char2,
         f::Rgb8Unorm => UChar3Normalized,
-        f::Rgb8Inorm => Char3Normalized,
+        f::Rgb8Snorm => Char3Normalized,
         f::Rgb8Uint => UChar3,
-        f::Rgb8Int => Char3,
+        f::Rgb8Sint => Char3,
         f::Rgba8Unorm => UChar4Normalized,
-        f::Rgba8Inorm => Char4Normalized,
+        f::Rgba8Snorm => Char4Normalized,
         f::Rgba8Uint => UChar4,
-        f::Rgba8Int => Char4,
+        f::Rgba8Sint => Char4,
         f::Bgra8Unorm => UChar4Normalized_BGRA,
         f::R16Unorm => UShortNormalized,
-        f::R16Inorm => ShortNormalized,
+        f::R16Snorm => ShortNormalized,
         f::R16Uint => UShort,
-        f::R16Int => Short,
-        f::R16Float => Half,
+        f::R16Sint => Short,
+        f::R16Sfloat => Half,
         f::Rg16Unorm => UShort2Normalized,
-        f::Rg16Inorm => Short2Normalized,
+        f::Rg16Snorm => Short2Normalized,
         f::Rg16Uint => UShort2,
-        f::Rg16Int => Short2,
-        f::Rg16Float => Half2,
+        f::Rg16Sint => Short2,
+        f::Rg16Sfloat => Half2,
         f::Rgb16Unorm => UShort3Normalized,
-        f::Rgb16Inorm => Short3Normalized,
+        f::Rgb16Snorm => Short3Normalized,
         f::Rgb16Uint => UShort3,
-        f::Rgb16Int => Short3,
-        f::Rgb16Float => Half3,
+        f::Rgb16Sint => Short3,
+        f::Rgb16Sfloat => Half3,
         f::Rgba16Unorm => UShort4Normalized,
-        f::Rgba16Inorm => Short4Normalized,
+        f::Rgba16Snorm => Short4Normalized,
         f::Rgba16Uint => UShort4,
-        f::Rgba16Int => Short4,
-        f::Rgba16Float => Half4,
+        f::Rgba16Sint => Short4,
+        f::Rgba16Sfloat => Half4,
         f::R32Uint => UInt,
-        f::R32Int => Int,
-        f::R32Float => Float,
+        f::R32Sint => Int,
+        f::R32Sfloat => Float,
         f::Rg32Uint => UInt2,
-        f::Rg32Int => Int2,
-        f::Rg32Float => Float2,
+        f::Rg32Sint => Int2,
+        f::Rg32Sfloat => Float2,
         f::Rgb32Uint => UInt3,
-        f::Rgb32Int => Int3,
-        f::Rgb32Float => Float3,
+        f::Rgb32Sint => Int3,
+        f::Rgb32Sfloat => Float3,
         f::Rgba32Uint => UInt4,
-        f::Rgba32Int => Int4,
-        f::Rgba32Float => Float4,
+        f::Rgba32Sint => Int4,
+        f::Rgba32Sfloat => Float4,
         _ => return None,
     })
 }
@@ -1065,13 +1069,13 @@ pub fn resource_options_from_storage_and_cache(
 }
 
 pub fn map_texture_usage(usage: image::Usage, tiling: image::Tiling) -> MTLTextureUsage {
-    use hal::image::Usage as U;
+    use self::hal::image::Usage as U;
 
     let mut texture_usage = MTLTextureUsage::PixelFormatView;
     if usage.intersects(U::COLOR_ATTACHMENT | U::DEPTH_STENCIL_ATTACHMENT) {
         texture_usage |= MTLTextureUsage::RenderTarget;
     }
-    if usage.intersects(U::SAMPLED) {
+    if usage.intersects(U::SAMPLED | U::INPUT_ATTACHMENT) {
         texture_usage |= MTLTextureUsage::ShaderRead;
     }
     if usage.intersects(U::STORAGE) {
@@ -1090,7 +1094,7 @@ pub fn map_texture_usage(usage: image::Usage, tiling: image::Tiling) -> MTLTextu
 }
 
 pub fn map_texture_type(view_kind: image::ViewKind) -> MTLTextureType {
-    use hal::image::ViewKind as Vk;
+    use self::hal::image::ViewKind as Vk;
     match view_kind {
         Vk::D1 => MTLTextureType::D1,
         Vk::D1Array => MTLTextureType::D1Array,
@@ -1171,6 +1175,22 @@ pub fn map_winding(face: pso::FrontFace) -> MTLWinding {
     match face {
         pso::FrontFace::Clockwise => MTLWinding::Clockwise,
         pso::FrontFace::CounterClockwise => MTLWinding::CounterClockwise,
+    }
+}
+
+pub fn map_polygon_mode(mode: pso::PolygonMode) -> MTLTriangleFillMode {
+    match mode {
+        pso::PolygonMode::Point => {
+            warn!("Unable to fill with points");
+            MTLTriangleFillMode::Lines
+        }
+        pso::PolygonMode::Line(width) => {
+            if width != 1.0 {
+                warn!("Unsupported line width: {:?}", width);
+            }
+            MTLTriangleFillMode::Lines
+        }
+        pso::PolygonMode::Fill => MTLTriangleFillMode::Fill,
     }
 }
 

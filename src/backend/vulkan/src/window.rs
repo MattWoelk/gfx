@@ -5,19 +5,22 @@ use std::sync::Arc;
 use ash::extensions::khr;
 use ash::vk;
 
-use hal;
-use hal::format::Format;
-use hal::image::{NumSamples, Size};
+use crate::hal;
+use crate::hal::format::Format;
+use crate::hal::image::{NumSamples, Size};
 
 #[cfg(feature = "winit")]
 use winit;
 
-use conv;
-use {Backend, Instance, PhysicalDevice, QueueFamily, RawInstance, VK_ENTRY};
+use crate::{conv, native};
+use crate::{Backend, Instance, PhysicalDevice, QueueFamily, RawInstance, VK_ENTRY};
 
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct Surface {
     // Vk (EXT) specs [29.2.7 Platform-Independent Information]
     // For vkDestroySurfaceKHR: Host access to surface must be externally synchronized
+    #[derivative(Debug = "ignore")]
     pub(crate) raw: Arc<RawSurface>,
     pub(crate) width: Size,
     pub(crate) height: Size,
@@ -39,7 +42,7 @@ impl Drop for RawSurface {
 }
 
 impl Instance {
-    #[cfg(all(unix, not(target_os = "android")))]
+    #[cfg(all(feature = "x11", unix, not(target_os = "android"), not(target_os = "macos")))]
     pub fn create_surface_from_xlib(&self, dpy: *mut vk::Display, window: vk::Window) -> Surface {
         let entry = VK_ENTRY
             .as_ref()
@@ -77,7 +80,7 @@ impl Instance {
         self.create_surface_from_vk_surface_khr(surface, width, height, 1)
     }
 
-    #[cfg(all(unix, not(target_os = "android")))]
+    #[cfg(all(feature = "xcb", unix, not(target_os = "android"), not(target_os = "macos")))]
     pub fn create_surface_from_xcb(
         &self,
         connection: *mut vk::xcb_connection_t,
@@ -191,16 +194,15 @@ impl Instance {
         }
 
         let surface = {
+            let info = vk::Win32SurfaceCreateInfoKHR {
+                s_type: vk::StructureType::WIN32_SURFACE_CREATE_INFO_KHR,
+                p_next: ptr::null(),
+                flags: vk::Win32SurfaceCreateFlagsKHR::empty(),
+                hinstance: hinstance as *mut _,
+                hwnd: hwnd as *mut _,
+            };
             let win32_loader = khr::Win32Surface::new(entry, &self.raw.0);
             unsafe {
-                let info = vk::Win32SurfaceCreateInfoKHR {
-                    s_type: vk::StructureType::WIN32_SURFACE_CREATE_INFO_KHR,
-                    p_next: ptr::null(),
-                    flags: vk::Win32SurfaceCreateFlagsKHR::empty(),
-                    hinstance: hinstance as *mut _,
-                    hwnd: hwnd as *mut _,
-                };
-
                 win32_loader
                     .create_win32_surface(&info, None)
                     .expect("Unable to create Win32 surface")
@@ -225,9 +227,81 @@ impl Instance {
         self.create_surface_from_vk_surface_khr(surface, width, height, 1)
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn create_surface_from_nsview(&self, view: *mut c_void) -> Surface {
+        use ash::extensions::mvk;
+        use core_graphics::{
+            geometry::CGRect,
+            base::CGFloat,
+        };
+        use objc::runtime::{Object, YES, BOOL};
+
+        // TODO: this logic is duplicated from gfx-backend-metal, refactor?
+        unsafe {
+            let view = view as *mut Object;
+            let existing: *mut Object = msg_send![view, layer];
+            let class = class!(CAMetalLayer);
+
+            let use_current = if existing.is_null() {
+                false
+            } else {
+                let result: BOOL = msg_send![existing, isKindOfClass: class];
+                result == YES
+            };
+
+            if !use_current {
+                let layer: *mut Object = msg_send![class, new];
+                msg_send![view, setLayer: layer];
+                let bounds: CGRect = msg_send![view, bounds];
+                msg_send![layer, setBounds: bounds];
+
+                let window: *mut Object = msg_send![view, window];
+                if !window.is_null() {
+                    let scale_factor: CGFloat = msg_send![window, backingScaleFactor];
+                    msg_send![layer, setContentsScale: scale_factor];
+                }
+            }
+        }
+
+        let entry = VK_ENTRY
+            .as_ref()
+            .expect("Unable to load Vulkan entry points");
+
+        if !self.extensions.contains(&mvk::MacOSSurface::name()) {
+            panic!("Vulkan driver does not support VK_MVK_MACOS_SURFACE");
+        }
+
+        let surface = {
+            let mac_os_loader = mvk::MacOSSurface::new(entry, &self.raw.0);
+            let info = vk::MacOSSurfaceCreateInfoMVK {
+                s_type: vk::StructureType::MACOS_SURFACE_CREATE_INFO_M,
+                p_next: ptr::null(),
+                flags: vk::MacOSSurfaceCreateFlagsMVK::empty(),
+                p_view: view,
+            };
+
+            unsafe {
+                mac_os_loader
+                    .create_mac_os_surface_mvk(&info, None)
+                    .expect("Unable to create macOS surface")
+            }
+        };
+
+        let (width, height) = {
+            //TODO: this is probably wrong, needs refinement
+            let bounds: CGRect = unsafe {
+                msg_send![view as *mut Object, bounds]
+            };
+            (bounds.size.width as u32, bounds.size.height as u32)
+        };
+
+        self.create_surface_from_vk_surface_khr(surface, width, height, 1)
+    }
+
     #[cfg(feature = "winit")]
+    #[allow(unreachable_code)]
     pub fn create_surface(&self, window: &winit::Window) -> Surface {
-        #[cfg(all(unix, not(target_os = "android")))]
+        #[cfg(all(feature = "x11", unix, not(target_os = "android"), not(target_os = "macos")))]
         {
             use winit::os::unix::WindowExt;
 
@@ -258,7 +332,7 @@ impl Instance {
             let logical_size = window.get_inner_size().unwrap();
             let width = logical_size.width * window.get_hidpi_factor();
             let height = logical_size.height * window.get_hidpi_factor();
-            self.create_surface_android(window.get_native_window(), width as _, height as _)
+            return self.create_surface_android(window.get_native_window(), width as _, height as _);
         }
         #[cfg(windows)]
         {
@@ -267,11 +341,19 @@ impl Instance {
 
             let hinstance = unsafe { GetModuleHandleW(ptr::null()) };
             let hwnd = window.get_hwnd();
-            self.create_surface_from_hwnd(hinstance as *mut _, hwnd as *mut _)
+            return self.create_surface_from_hwnd(hinstance as *mut _, hwnd as *mut _);
         }
+        #[cfg(target_os = "macos")]
+        {
+            use winit::os::macos::WindowExt;
+
+            return self.create_surface_from_nsview(window.get_nsview());
+        }
+        let _ = window;
+        panic!("No suitable WSI enabled!");
     }
 
-    fn create_surface_from_vk_surface_khr(
+    pub fn create_surface_from_vk_surface_khr(
         &self,
         surface: vk::SurfaceKHR,
         width: Size,
@@ -403,8 +485,11 @@ impl hal::Surface<Backend> for Surface {
     }
 }
 
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct Swapchain {
     pub(crate) raw: vk::SwapchainKHR,
+    #[derivative(Debug = "ignore")]
     pub(crate) functor: khr::Swapchain,
 }
 
@@ -412,12 +497,11 @@ impl hal::Swapchain<Backend> for Swapchain {
     unsafe fn acquire_image(
         &mut self,
         timeout_ns: u64,
-        sync: hal::FrameSync<Backend>,
-    ) -> Result<hal::SwapImageIndex, hal::AcquireError> {
-        let (semaphore, fence) = match sync {
-            hal::FrameSync::Semaphore(semaphore) => (semaphore.0, vk::Fence::null()),
-            hal::FrameSync::Fence(fence) => (vk::Semaphore::null(), fence.0),
-        };
+        semaphore: Option<&native::Semaphore>,
+        fence: Option<&native::Fence>,
+    ) -> Result<(hal::SwapImageIndex, Option<hal::window::Suboptimal>), hal::AcquireError> {
+        let semaphore = semaphore.map_or(vk::Semaphore::null(), |s| s.0);
+        let fence = fence.map_or(vk::Fence::null(), |f| f.0);
 
         // will block if no image is available
         let index = self
@@ -427,18 +511,27 @@ impl hal::Swapchain<Backend> for Swapchain {
         match index {
             Ok((i, suboptimal)) => {
                 if suboptimal {
-                    // The index is still valid in this case but the swapchain no longer matches
-                    Err(hal::AcquireError::OutOfDate)
+                    Ok((i, Some(hal::window::Suboptimal)))
                 } else {
-                    Ok(i)
+                    Ok((i, None))
                 }
             }
             Err(vk::Result::NOT_READY) => Err(hal::AcquireError::NotReady),
-            Err(vk::Result::SUBOPTIMAL_KHR) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+            Err(vk::Result::TIMEOUT) => Err(hal::AcquireError::Timeout),
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 Err(hal::AcquireError::OutOfDate)
             }
             Err(vk::Result::ERROR_SURFACE_LOST_KHR) => {
                 Err(hal::AcquireError::SurfaceLost(hal::device::SurfaceLost))
+            }
+            Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY) => {
+                Err(hal::AcquireError::OutOfMemory(hal::device::OutOfMemory::OutOfHostMemory))
+            }
+            Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY) => {
+                Err(hal::AcquireError::OutOfMemory(hal::device::OutOfMemory::OutOfDeviceMemory))
+            }
+            Err(vk::Result::ERROR_DEVICE_LOST) => {
+                Err(hal::AcquireError::DeviceLost(hal::device::DeviceLost))
             }
             _ => panic!("Failed to acquire image."),
         }
